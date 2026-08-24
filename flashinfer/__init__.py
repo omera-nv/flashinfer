@@ -207,6 +207,7 @@ from .gdn_kernels.experimental import (
     gdn_fused_decode_step as gdn_fused_decode_step,
     gdn_fused_decode_step_supported as gdn_fused_decode_step_supported,
 )
+from .gdn_product import chunk_gated_delta_product as chunk_gated_delta_product
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_bf16 as bmm_bf16
 from .gemm import bmm_fp8 as bmm_fp8
