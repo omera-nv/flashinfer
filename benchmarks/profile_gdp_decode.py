@@ -82,75 +82,94 @@ def _sweep(a):
     Across groups it varies by design -- comparing there would be meaningless.
     """
     rows, vllm_by_cfg, failures = {}, {}, []
-    for D in a.head_size:
-        for B in a.batch_size:
-            for T in a.draft_len:
-                for tv in a.force_tile_v:
-                    if D % tv:
-                        continue
-                    proc = subprocess.run(
-                        [
-                            sys.executable,
-                            __file__,
-                            "--num-householder",
-                            str(a.num_householder),
-                            "--head-size",
-                            str(D),
-                            "--batch-size",
-                            str(B),
-                            "--draft-len",
-                            str(T),
-                            "--force-tile-v",
-                            str(tv),
-                            "--iters",
-                            str(a.iters),
-                            "--warmup",
-                            str(a.warmup),
-                            "--dtype",
-                            a.dtype[0],
-                            "--num-q-heads",
-                            str(a.num_q_heads),
-                            "--num-v-heads",
-                            str(a.num_v_heads),
-                        ],
-                        capture_output=True,
-                        text=True,
-                    )
-                    hits = 0
-                    for line in proc.stdout.splitlines():
-                        if not line.startswith("RESULT\t"):
+    for D_K in a.head_size:
+        for D_V in a.v_head_size:
+            for B in a.batch_size:
+                for T in a.draft_len:
+                    for tv in a.force_tile_v:
+                        if D_V % tv:
                             continue
-                        _, name, kern, _tot = line.split("\t")
-                        if name.startswith("vllm"):
-                            vllm_by_cfg.setdefault((D, B, T), []).append(float(kern))
-                        elif f"tile_v={tv}" in name and "heuristic" not in name:
-                            rows[(D, B, T, tv)] = float(kern)
-                            hits += 1
-                    if not hits:
-                        tail = (proc.stdout + proc.stderr).strip().splitlines()
-                        failures.append(
-                            (D, B, T, tv, tail[-1][:90] if tail else "no output")
+                        proc = subprocess.run(
+                            [
+                                sys.executable,
+                                __file__,
+                                "--num-householder",
+                                str(a.num_householder),
+                                "--head-size",
+                                str(D_K),
+                                "--v-head-size",
+                                str(D_V),
+                                "--batch-size",
+                                str(B),
+                                "--draft-len",
+                                str(T),
+                                "--force-tile-v",
+                                str(tv),
+                                "--iters",
+                                str(a.iters),
+                                "--warmup",
+                                str(a.warmup),
+                                "--dtype",
+                                a.dtype[0],
+                                "--num-q-heads",
+                                str(a.num_q_heads),
+                                "--num-v-heads",
+                                str(a.num_v_heads),
+                            ],
+                            capture_output=True,
+                            text=True,
                         )
-                    print(f"  ran D={D} B={B} T={T} tile_v={tv}", flush=True)
+                        hits = 0
+                        for line in proc.stdout.splitlines():
+                            if not line.startswith("RESULT\t"):
+                                continue
+                            _, name, kern, _tot = line.split("\t")
+                            if name.startswith("vllm"):
+                                vllm_by_cfg.setdefault((D_K, D_V, B, T), []).append(
+                                    float(kern)
+                                )
+                            elif f"tile_v={tv}" in name and "heuristic" not in name:
+                                rows[(D_K, D_V, B, T, tv)] = float(kern)
+                                hits += 1
+                        if not hits:
+                            tail = (proc.stdout + proc.stderr).strip().splitlines()
+                            failures.append(
+                                (
+                                    D_K,
+                                    D_V,
+                                    B,
+                                    T,
+                                    tv,
+                                    tail[-1][:90] if tail else "no output",
+                                )
+                            )
+                        print(
+                            f"  ran K={D_K} V={D_V} B={B} T={T} tile_v={tv}", flush=True
+                        )
 
     print(
-        f"\n{'D':>4} {'batch':>6} {'T':>3} | "
+        f"\n{'K':>4} {'V':>4} {'batch':>6} {'T':>3} | "
         + " ".join(f"tile_v={tv:<3}" for tv in a.force_tile_v)
         + " |    best      vllm  speedup"
     )
-    for D, B, T in sorted({k[:3] for k in rows}):
-        got = {
-            tv: rows[(D, B, T, tv)] for tv in a.force_tile_v if (D, B, T, tv) in rows
-        }
+    # rows/vllm_by_cfg are keyed by the FULL config (K, V, B, T[, tile_v]);
+    # slicing to a shorter prefix silently produces lookups that never match.
+    for cfg in sorted({k[:4] for k in rows}):
+        D_K, D_V, B, T = cfg
+        got = {tv: rows[cfg + (tv,)] for tv in a.force_tile_v if cfg + (tv,) in rows}
+        if not got:
+            continue
         best = min(got, key=got.get)
         cells = " ".join(
             f"{got[tv]:10.1f}" if tv in got else f"{'-':>10}" for tv in a.force_tile_v
         )
         # vllm from THIS config only, never a cross-config average
-        v = vllm_by_cfg.get((D, B, T))
+        v = vllm_by_cfg.get(cfg)
         vcol = f"{sorted(v)[len(v) // 2]:9.1f}" if v else f"{'-':>9}"
         spd = f"{sorted(v)[len(v) // 2] / got[best]:7.2f}x" if v else f"{'-':>8}"
-        print(f"{D:>4} {B:>6} {T:>3} | {cells} | tile_v={best:<3} {vcol} {spd}")
+        print(
+            f"{D_K:>4} {D_V:>4} {B:>6} {T:>3} | {cells} | tile_v={best:<3} {vcol} {spd}"
+        )
 
     worst = 0.0
     for _cfg, times in vllm_by_cfg.items():
@@ -159,14 +178,17 @@ def _sweep(a):
     print(f"\ndrift control: worst vllm spread within a single config: {worst:.2f}%")
     if worst > 2:
         print("  -> children of the same config disagree; raise --iters")
-    for D, B, T, tv, why in failures:
-        print(f"  FAILED D={D} B={B} T={T} tile_v={tv}: {why}")
+    for D_K, D_V, B, T, tv, why in failures:
+        print(f"  FAILED K={D_K} V={D_V} B={B} T={T} tile_v={tv}: {why}")
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--num-householder", type=int, default=3)
     p.add_argument("--head-size", type=int, nargs="+", choices=[64, 128], default=[128])
+    p.add_argument(
+        "--v-head-size", type=int, nargs="+", choices=[64, 128], default=[128]
+    )
     p.add_argument("--draft-len", type=int, nargs="+", default=[4])
     p.add_argument("--batch-size", type=int, nargs="+", default=[128])
     p.add_argument("--dtype", choices=list(bench.DTYPES), default="bfloat16")
@@ -200,8 +222,9 @@ def main():
             p.error("--sweep needs --force-tile-v with the values to compare")
         _sweep(a)
         return
-    a.head_size, a.batch_size, a.draft_len = (
+    a.head_size, a.v_head_size, a.batch_size, a.draft_len = (
         a.head_size[0],
+        a.v_head_size[0],
         a.batch_size[0],
         a.draft_len[0],
     )
@@ -214,10 +237,11 @@ def main():
         a.draft_len,
         a.num_householder,
         a.head_size,
+        a.v_head_size,
         bench.DTYPES[a.dtype[0]],
     )
     print(
-        f"D={a.head_size} n_h={a.num_householder} B={a.batch_size} T={a.draft_len} "
+        f"D_K={a.head_size} D_V={a.v_head_size} n_h={a.num_householder} B={a.batch_size} T={a.draft_len} "
         f"{a.dtype[0]}  (vllm {'available' if bench.HAS_VLLM else 'NOT importable'})"
     )
     for name, (fn, _) in runners.items():
@@ -236,10 +260,11 @@ def main():
             a.batch_size,
             a.draft_len * a.num_householder,
             num_v_heads=a.num_v_heads,
-            v_dim=a.head_size,
+            v_dim=a.v_head_size,
+            k_dim=a.head_size,
         )[0]
         tv = chosen if tile_v is None else tile_v
-        ctas = a.batch_size * a.num_v_heads * (a.head_size // tv)
+        ctas = a.batch_size * a.num_v_heads * (a.v_head_size // tv)
         label = f"flashinfer tile_v={tv}" + (" (heuristic)" if tile_v is None else "")
         seen.setdefault(tv, []).append(
             _profile(f"{label}  ~{ctas} CTAs", fi, a.warmup, a.iters)
