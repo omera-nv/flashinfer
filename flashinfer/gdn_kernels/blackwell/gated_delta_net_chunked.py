@@ -4000,7 +4000,7 @@ class GatedDeltaNetChunkedKernel:
                 tcgen05.copy.St16x32bx2Op(tcgen05.copy.Repetition(16)),
                 self.acc_dtype,
             )
-            tCtState_for_r2t = tCtState[(None, None), 0, 0, 0]
+            tCtState_for_r2t = tCtState_mn_view[None, None, 0]
         else:
             state_r2t_atom = cute.make_copy_atom(
                 tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
@@ -4129,7 +4129,7 @@ class GatedDeltaNetChunkedKernel:
                 tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(16)),
                 self.acc_dtype,
             )
-            tCtState_for_t2r = tCtState[(None, None), 0, 0, 0]
+            tCtState_for_t2r = tCtState_mn_view[None, None, 0]
         else:
             atom_state_t2r = cute.make_copy_atom(
                 tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
@@ -4263,7 +4263,7 @@ class GatedDeltaNetChunkedKernel:
                 tcgen05.copy.St16x32bx2Op(tcgen05.copy.Repetition(16)),
                 self.acc_dtype,
             )
-            tCtState_for_t2r = tCtState[(None, None), 0, 0, 0]
+            tCtState_for_t2r = tCtState_mn_view[None, None, 0]
         else:
             atom_state_t2r = cute.make_copy_atom(
                 tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
@@ -4338,7 +4338,7 @@ class GatedDeltaNetChunkedKernel:
                 tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(16)),
                 self.acc_dtype,
             )
-            tCtShared_for_t2r = tCtShared[(None, None), 0, 0, 0]
+            tCtShared_for_t2r = tCtShared_mn_view[None, None, 0]
         else:
             atom_shared_t2r = cute.make_copy_atom(
                 tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)), self.acc_dtype
@@ -4437,8 +4437,8 @@ class GatedDeltaNetChunkedKernel:
                 tcgen05.copy.St16x32bx2Op(tcgen05.copy.Repetition(16)),
                 self.acc_dtype,
             )
-            tCtQState_for_t2r = tCtQState[(None, None), 0, 0, 0]
-            tCtQState_for_r2t = tCtQState[(None, None), 0, 0, 0]
+            tCtQState_for_t2r = tCtQState_mn_view[None, None, 0]
+            tCtQState_for_r2t = tCtQState_mn_view[None, None, 0]
         else:
             atom_qs_t2r = cute.make_copy_atom(
                 tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)), self.acc_dtype
