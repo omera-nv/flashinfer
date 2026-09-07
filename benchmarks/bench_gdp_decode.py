@@ -115,15 +115,9 @@ def _repeat_to_hv(x, HQ, HV):
 
 
 def _flashinfer_runner(t, B, T, n_h, HQ, HV, K, V, dtype, device):
-    """Preallocated expansion scratch, refilled per call -- as serving does."""
-    TN = T * n_h
+    """No expansion scratch: the kernel reads q/a at the real token index."""
     out = torch.empty(B, T, HV, V, dtype=dtype, device=device)
-    exp_q = torch.empty(B, TN, HQ, K, dtype=dtype, device=device) if n_h > 1 else None
-    exp_a = torch.empty(B, TN, HV, dtype=dtype, device=device) if n_h > 1 else None
-    exp_o = torch.empty(B, TN, HV, V, dtype=dtype, device=device) if n_h > 1 else None
-    mib = sum(
-        x.numel() * x.element_size() for x in (exp_q, exp_a, exp_o) if x is not None
-    ) / (1024**2)
+    mib = 0.0
 
     def run():
         gated_delta_product_mtp(
@@ -140,9 +134,6 @@ def _flashinfer_runner(t, B, T, n_h, HQ, HV, K, V, dtype, device):
             output=out,
             ssm_state_indices=t["ssm_idx"],
             disable_state_update=False,
-            expanded_q=exp_q,
-            expanded_a=exp_a,
-            expanded_output=exp_o,
         )
         return out
 
