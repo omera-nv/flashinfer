@@ -16,30 +16,18 @@ limitations under the License.
 
 """FlashInfer GDP decode vs vLLM's GDN kernel driven by the same expansion.
 
-Neither project ships a DeltaProduct decode kernel -- vLLM has no
-``num_householder`` anywhere -- so both columns are the same trick: expand one
-real token into ``n_h`` micro-steps (gate neutral on all but the first, query
-zero on all but the last) and hand the result to a GDN kernel.
+GDP decode is GDN on a sequence n_h times longer: gate neutral on all but the
+first micro-step of a token, query zero on all but the last. Both columns do
+that expansion, then call a GDN kernel:
 
-  flashinfer   gated_delta_product_mtp -> gated_delta_rule_mtp
-  vllm         the same expansion -> fused_sigmoid_gating_delta_rule_update,
-               which is what vLLM's own speculative-decode path calls
-               (qwen_gdn_linear_attn.py ~1381)
+  flashinfer   gated_delta_product_mtp
+  vllm         fused_sigmoid_gating_delta_rule_update (its spec-decode path)
 
-Both write a per-token state snapshot and skip the intermediate micro-steps via
-a slot their scatters guard on, so this compares the same work rather than two
-different amounts of it.
+Both write a per-token state snapshot and skip the intermediates. vLLM gets
+T+1 writes to our T, because its read slot doubles as a write target.
 
-One asymmetry worth knowing: vLLM overloads ``ssm_state_indices`` for BOTH the
-initial-state read (at ``num_accepted_tokens - 1``) and the per-token write,
-while FlashInfer takes separate ``initial_state_indices`` and
-``ssm_state_indices``. The read slot therefore doubles as a write target on the
-vLLM side, giving it T+1 writes to our T -- small at these T, but real.
-
-Run --check first. A latency comparison between kernels that disagree
-numerically measures nothing; it reports RELATIVE error, because these outputs
-are order 1e-3 and an absolute tolerance passes even when they are
-uncorrelated.
+Run --check first; it reports relative error, since these outputs are ~1e-3 and
+an absolute tolerance would pass on uncorrelated results.
 
 Examples
 --------
@@ -49,6 +37,7 @@ python benchmarks/bench_gdp_decode.py --num-householder 2 3 --head-size 64 128 \
 """
 
 import argparse
+import inspect
 
 import numpy as np
 import torch
@@ -60,10 +49,29 @@ try:
     from vllm.third_party.flash_linear_attention.ops import (
         fused_sigmoid_gating_delta_rule_update,
     )
+    from vllm import _custom_ops as vllm_ops
+    from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
+        layer_norm_fwd,
+    )
 
     HAS_VLLM = True
 except ImportError:  # pragma: no cover - benchmark-only dependency
     HAS_VLLM = False
+
+# vLLM's hand-written CUDA path (csrc/libtorch_stable/gdn/fused_gdn_decode_kernel.cu).
+# It fuses qkv unpack + decode + gated RMSNorm + output gate into ONE launch, so it
+# is only comparable against flashinfer's kernel PLUS a separate norm -- which is
+# what the `--fused` columns do. Requires vLLM's C extension to be built; vLLM
+# itself falls back to the triton path when it is not.
+HAS_VLLM_FUSED = HAS_VLLM and hasattr(torch.ops._C, "fused_gdn_decode_post_conv_mtp")
+# The wrapper's signature moves between vLLM versions (output_gate_activation is
+# present on some, absent on others) and the INSTALLED vllm need not match the
+# checkout you are reading. Filter kwargs against the runtime signature.
+_FUSED_KW = (
+    set(inspect.signature(vllm_ops.fused_gdn_decode_post_conv_mtp).parameters)
+    if HAS_VLLM_FUSED
+    else set()
+)
 
 DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16}
 
@@ -71,14 +79,11 @@ DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16}
 def _make_inputs(B, T, n_h, HQ, HV, K, dtype, device, seed):
     """Dense decode inputs plus a state pool.
 
-    Magnitudes and dtypes follow tests/gdn/test_decode_delta_product.py: ``a``
-    and ``b`` are the MODEL dtype (raw logits the kernels convert internally),
-    only A_log/dt_bias are fp32, everything scaled to ~0.1 so the gate stays in
-    a sane range.
+    ``a``/``b`` are the model dtype (raw logits the kernels convert internally),
+    A_log/dt_bias fp32, everything ~0.1 to keep the gate in range.
 
-    Pool layout, all disjoint: row 0 unused (0 is a skip sentinel on both
-    sides), then one initial state per request, then one snapshot per real
-    token.
+    Pool rows, disjoint: 0 unused (it is a skip sentinel), then one initial
+    state per request, then one snapshot per real token.
     """
     torch.manual_seed(seed)
     with device:
@@ -93,14 +98,18 @@ def _make_inputs(B, T, n_h, HQ, HV, K, dtype, device, seed):
             pool=torch.randn(1 + B + B * T, HV, K, K, dtype=torch.float32) * 0.01,
             initial_idx=torch.arange(1, 1 + B, dtype=torch.int32),
             ssm_idx=torch.arange(1 + B, 1 + B + B * T, dtype=torch.int32).reshape(B, T),
+            # output gate for the fused comparison: ONE tensor, so both sides
+            # gate the same values. Drawn per real token; the vllm side expands
+            # it, and the intermediate micro-steps it invents are discarded.
+            gate=torch.randn(B, T, HV, K, dtype=dtype) * 0.1,
+            norm_weight=torch.ones(K, dtype=dtype),
         )
 
 
 def _repeat_to_hv(x, HQ, HV):
-    """vLLM's kernel needs one head count; its layer repeats q/k for GQA.
-
-    Timed, because a vLLM caller pays it every step -- FlashInfer is GQA-native.
-    Pass --num-q-heads == --num-v-heads to remove the confound.
+    """vLLM's kernel needs one head count. Timed, since a vLLM caller pays this
+    every step; FlashInfer is GQA-native. --num-q-heads == --num-v-heads
+    removes the confound.
     """
     return x if HQ == HV else x.repeat_interleave(HV // HQ, dim=-2)
 
@@ -179,14 +188,132 @@ def _vllm_runner(t, B, T, n_h, HQ, HV, K, dtype, device):
     return run, 0.0
 
 
+def _norm_gate(x, gate, out, weight, eps):
+    """Gated RMSNorm + output gate, called the way vLLM's non-fused path calls it
+    (qwen_gdn_linear_attn.py:1833). This is the work their fused kernel absorbs,
+    so flashinfer has to pay it explicitly for the comparison to mean anything."""
+    x2, g2, o2 = (t.reshape(-1, t.shape[-1]) for t in (x, gate, out))
+    layer_norm_fwd(
+        x2,
+        weight,
+        None,
+        eps,
+        z=g2,
+        out=o2,
+        group_size=x.shape[-1],
+        # The fused kernel sums squares over the RAW decode output and applies
+        # the gate afterwards (fused_gdn_decode_kernel.cu:345-362) -- that is
+        # norm(x) * silu(z). False would fold the gate into the sum of squares
+        # and normalise by a different quantity.
+        norm_before_gate=True,
+        is_rms_norm=True,
+        activation="silu",
+    )
+
+
+def _flashinfer_fused_runner(t, B, T, n_h, HQ, HV, K, dtype, device):
+    """flashinfer decode + the norm/gate their CUDA kernel fuses in."""
+    inner, mib = _flashinfer_runner(t, B, T, n_h, HQ, HV, K, dtype, device)
+    final = torch.empty(B, T, HV, K, dtype=dtype, device=device)
+
+    def run():
+        _norm_gate(inner(), t["gate"], final, t["norm_weight"], 1e-5)
+        return final
+
+    return run, mib
+
+
+def _vllm_fused_runner(t, B, T, n_h, HQ, HV, K, dtype, device):
+    """vLLM's fused CUDA kernel: unpack + decode + norm + gate, one launch.
+
+    Takes mixed_qkv packed as [tokens, 2*key_dim + value_dim] post-conv, and a
+    1D state_indices -- one slot per REQUEST, with num_accepted_tokens driving
+    rollback, rather than the per-token scatter the other paths use.
+    """
+    TN = T * n_h
+    kd, vd = HQ * K, HV * K
+    mixed_qkv = torch.cat(
+        [
+            t["q"].new_zeros(B * TN, kd),
+            _repeat_to_hv(t["k"].flatten(1, 2), HQ, HQ).reshape(B * TN, kd),
+            t["v"].flatten(1, 2).reshape(B * TN, vd),
+        ],
+        dim=-1,
+    ).contiguous()
+    mixed_qkv[:, :kd] = 0
+    mixed_qkv[:, :kd].view(B, TN, HQ, K)[:, n_h - 1 :: n_h] = t["q"]
+    a = torch.full((B * TN, HV), GATE_NEUTRAL_A_SENTINEL, dtype=dtype, device=device)
+    a.view(B, TN, HV)[:, ::n_h] = t["a"]
+    cu = torch.arange(0, B * TN + 1, TN, dtype=torch.int32, device=device)
+    # [N, S], not 1D: the kernel wants one column per spec token
+    # (tests/kernels/mamba/test_gdn_fused_mtp.py builds torch.ones(1, SPEC_TOKENS)).
+    state_idx_2d = t["initial_idx"][:, None].expand(B, TN).contiguous()
+    out = torch.empty(B * TN, HV, K, dtype=dtype, device=device)
+    # same gate as flashinfer at the real-token rows; intermediates are dropped
+    gate = torch.zeros(B, TN, HV, K, dtype=dtype, device=device)
+    gate[:, n_h - 1 :: n_h] = t["gate"]
+    gate = gate.reshape(B * TN, HV, K)
+
+    def run():
+        # the vllm._custom_ops wrapper, not torch.ops._C directly: the raw op
+        # takes 14 args and no output_gate_activation, which the wrapper applies.
+        kw = dict(
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=t["b"].reshape(B * TN, HV),
+            A_log=t["A_log"],
+            dt_bias=t["dt_bias"],
+            state_indices=state_idx_2d,
+            cu_seqlens=cu,
+            num_accepted_tokens=torch.full((B,), TN, dtype=torch.int32, device=device),
+            state=t["pool"],
+            output_gate=gate,
+            norm_weight=t["norm_weight"],
+            out=out,
+            scale=K**-0.5,
+            norm_eps=1e-5,
+            output_gate_activation="silu",
+        )
+        vllm_ops.fused_gdn_decode_post_conv_mtp(
+            **{k: v for k, v in kw.items() if k in _FUSED_KW}
+        )
+        return out.view(B, TN, HV, K)[:, n_h - 1 :: n_h]
+
+    return run, 0.0
+
+
 def _runners(args, B, T, n_h, K, dtype):
+    """Build one runner per comparable column."""
     HQ, HV = args.num_q_heads, args.num_v_heads
     device = torch.device("cuda")
     t = _make_inputs(B, T, n_h, HQ, HV, K, dtype, device, args.seed)
+    # snapshot BEFORE the availability probe below, which mutates the pool
+    t["pool_pristine"] = t["pool"].clone()
     r = {"flashinfer": _flashinfer_runner(t, B, T, n_h, HQ, HV, K, dtype, device)}
     if HAS_VLLM:
         r["vllm"] = _vllm_runner(t, B, T, n_h, HQ, HV, K, dtype, device)
-    return r
+    if HAS_VLLM_FUSED:
+        # The fused kernel's supported HV/H ratios are version-dependent (0.28.0
+        # allows 1 only; {1,2,3,4,8} landed later), and it validates shapes
+        # internally. Probe once rather than encode a version's rules.
+        fused = _vllm_fused_runner(t, B, T, n_h, HQ, HV, K, dtype, device)
+        try:
+            fused[0]()
+            torch.cuda.synchronize()
+        except RuntimeError as exc:
+            if _runners.warned is None:
+                _runners.warned = True
+                print(f"NOTE: vllm fused kernel unavailable for this shape -- {exc}")
+        else:
+            # end-to-end pair: both sides produce the final layer output
+            r["flashinfer+norm"] = _flashinfer_fused_runner(
+                t, B, T, n_h, HQ, HV, K, dtype, device
+            )
+            r["vllm-fused"] = fused
+    return t, r
+
+
+_runners.warned = None
 
 
 def _configs(args):
@@ -198,25 +325,45 @@ def _configs(args):
                         yield dt, K, n_h, B, T
 
 
+# Which columns are comparable with which. The fused pair includes the gated
+# RMSNorm and output gate; the plain pair does not, so they are NOT comparable
+# across groups -- only within one.
+_CHECK_GROUPS = [
+    ("decode only", "flashinfer", ["vllm"]),
+    ("+ norm/gate", "flashinfer+norm", ["vllm-fused"]),
+]
+
+
 def _check(args):
-    print("correctness check -- relative L2 vs flashinfer")
+    print("correctness check -- relative L2, within comparable groups")
     for dt, K, n_h, B, T in _configs(args):
-        r = _runners(args, B, T, n_h, K, DTYPES[dt])
-        ref = r["flashinfer"][0]().float().clone()
-        cols = []
-        for name, (fn, _) in r.items():
-            if name == "flashinfer":
+        t, r = _runners(args, B, T, n_h, K, DTYPES[dt])
+        for label, ref_name, others in _CHECK_GROUPS:
+            present = [n for n in others if n in r]
+            if ref_name not in r or not present:
                 continue
-            got = fn().float()
-            if got.shape != ref.shape:
-                cols.append(f"{name}=SHAPE{tuple(got.shape)}")
-                continue
-            rel = ((got - ref).norm() / ref.norm().clamp_min(1e-30)).item()
-            cols.append(f"{name}={rel:.4f}" + ("" if rel < 0.02 else " <-- MISMATCH"))
-        print(
-            f"  {dt:9s} D={K:3d} n_h={n_h} B={B:4d} T={T}: "
-            + ("  ".join(cols) or "(vllm unavailable)")
-        )
+            # Every runner writes state into the SHARED pool -- flashinfer
+            # scatters snapshots, vllm-fused runs inplace_final_state on the
+            # rows it reads, and the availability probe already ran one of them.
+            # Restore the pool before each call so they all see one initial
+            # state; otherwise `got` is computed from whatever `ref` left behind.
+            t["pool"].copy_(t["pool_pristine"])
+            ref = r[ref_name][0]().float().clone()
+            cols = []
+            for name in present:
+                t["pool"].copy_(t["pool_pristine"])
+                got = r[name][0]().float()
+                if got.shape != ref.shape:
+                    cols.append(f"{name}=SHAPE{tuple(got.shape)}")
+                    continue
+                rel = ((got - ref).norm() / ref.norm().clamp_min(1e-30)).item()
+                cols.append(
+                    f"{name}={rel:.4f}" + ("" if rel < 0.02 else " <-- MISMATCH")
+                )
+            print(
+                f"  {dt:9s} D={K:3d} n_h={n_h} B={B:4d} T={T} "
+                f"[{label} vs {ref_name}]: " + "  ".join(cols)
+            )
 
 
 def main():
@@ -275,7 +422,7 @@ def main():
 
     for dt, K, n_h, B, T in _configs(args):
         try:
-            r = _runners(args, B, T, n_h, K, DTYPES[dt])
+            t, r = _runners(args, B, T, n_h, K, DTYPES[dt])
             got = {
                 n: (
                     float(
