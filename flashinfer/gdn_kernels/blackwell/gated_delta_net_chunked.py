@@ -54,6 +54,10 @@ Algorithm overview (per chunk c, tokens [cC, (c+1)C)):
     O[BT,DV]  = O_intra + T_col * QS             (combine intra + inter)
     S_next    = cumprod[BT-1] * S_prev + dS        (update state in TMEM)
 
+The tables below are for DK == DV == 128.  With DV < DK the V and O buffers
+shrink proportionally (they are the only DV-dependent SMEM), while the TMEM
+budget is unchanged -- DV sets lanes, and TMEM is allocated by column.
+
 SMEM layout (225.5 KB total):
   Buffer                           Size (B)  Stages
   q                                32768     1
@@ -185,8 +189,13 @@ class GatedDeltaNetChunkedKernel:
         io_dtype   : input/output dtype (Float16)
         acc_dtype  : accumulator dtype  (Float32)
         b_t        : fixed chunk size / block tile (64)
-        DK         : key/query hidden dim     (128)
-        DV         : value hidden dim         (128)
+        DK         : key/query hidden dim     (64 or 128)
+        DV         : value hidden dim         (64 or 128, DV <= DK)
+
+    DK and DV are carried by the MMA tilers rather than passed directly:
+    ``DK = mma_tiler_qk[2]`` and ``DV = mma_tiler_qkv[0]``.  Mode 0 of the
+    qs/qkv/kv tilers is the M (lane) extent of a value-shaped result, hence DV;
+    ``mma_tiler_kv[1]`` is the N (column) extent of the state, hence DK.
     """
 
     # TMA descriptor size in bytes
@@ -344,8 +353,12 @@ class GatedDeltaNetChunkedKernel:
         self.tmem_cg1_shared_acc_stages = 1
 
         self.tmem_state_offset = 0
+        # The state accumulator is (M=DV, N=DK): TMEM allocation is column-
+        # granular, so it reserves N=DK columns (mode 1) and DV lanes.  Mode 0
+        # is the lane extent and must NOT be used here -- the two coincide only
+        # when DV == DK.
         self.tmem_q_state_offset = (
-            self.tmem_state_offset + self.tmem_kv_acc_stages * self.mma_tiler_kv[0]
+            self.tmem_state_offset + self.tmem_kv_acc_stages * self.mma_tiler_kv[1]
         )
         self.tmem_state_inp_offset = (
             self.tmem_q_state_offset + self.tmem_q_state_acc_stages * 64
@@ -389,24 +402,36 @@ class GatedDeltaNetChunkedKernel:
             raise testing.CantImplementError(
                 f"inverse_dtype={inverse_dtype} must match io_dtype={io_dtype}"
             )
-        head_size = mma_tiler_qk[2]
-        if head_size not in (64, 128):
+        # Mode 0 of the qs/qkv/kv tilers is the M (lane) extent, which is DV for
+        # every GEMM that produces a value-shaped result; DK is the contraction
+        # extent of qk/qs and the N extent of kv.
+        DK = mma_tiler_qk[2]
+        DV = mma_tiler_qkv[0]
+        if DK not in (64, 128):
             raise testing.CantImplementError(
-                f"head_size={head_size} not supported; only 64 and 128 are supported"
+                f"head_size_k={DK} not supported; only 64 and 128 are supported"
             )
-        if mma_tiler_qk != (64, 64, head_size):
+        if DV not in (64, 128):
+            raise testing.CantImplementError(
+                f"head_size_v={DV} not supported; only 64 and 128 are supported"
+            )
+        if DV > DK:
+            raise testing.CantImplementError(
+                f"head_size_v={DV} > head_size_k={DK} is not supported"
+            )
+        if mma_tiler_qk != (64, 64, DK):
             raise testing.CantImplementError(
                 f"mma_tiler_qk={mma_tiler_qk} not supported"
             )
-        if mma_tiler_qs != (head_size, 64, head_size):
+        if mma_tiler_qs != (DV, 64, DK):
             raise testing.CantImplementError(
                 f"mma_tiler_qs={mma_tiler_qs} not supported"
             )
-        if mma_tiler_qkv != (head_size, 64, 64):
+        if mma_tiler_qkv != (DV, 64, 64):
             raise testing.CantImplementError(
                 f"mma_tiler_qkv={mma_tiler_qkv} not supported"
             )
-        if mma_tiler_kv != (head_size, head_size, 64):
+        if mma_tiler_kv != (DV, DK, 64):
             raise testing.CantImplementError(
                 f"mma_tiler_kv={mma_tiler_kv} not supported"
             )
