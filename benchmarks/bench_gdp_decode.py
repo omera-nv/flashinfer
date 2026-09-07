@@ -76,7 +76,7 @@ _FUSED_KW = (
 DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16}
 
 
-def _make_inputs(B, T, n_h, HQ, HV, K, dtype, device, seed):
+def _make_inputs(B, T, n_h, HQ, HV, K, V, dtype, device, seed):
     """Dense decode inputs plus a state pool.
 
     ``a``/``b`` are the model dtype (raw logits the kernels convert internally),
@@ -90,19 +90,19 @@ def _make_inputs(B, T, n_h, HQ, HV, K, dtype, device, seed):
         return dict(
             q=torch.randn(B, T, HQ, K, dtype=dtype) * 0.1,
             k=torch.randn(B, T, n_h, HQ, K, dtype=dtype) * 0.1,
-            v=torch.randn(B, T, n_h, HV, K, dtype=dtype) * 0.1,
+            v=torch.randn(B, T, n_h, HV, V, dtype=dtype) * 0.1,
             a=torch.randn(B, T, HV, dtype=dtype) * 0.1,
             b=torch.randn(B, T, n_h, HV, dtype=dtype) * 0.1,
             A_log=torch.randn(HV, dtype=torch.float32) * 0.1,
             dt_bias=torch.randn(HV, dtype=torch.float32) * 0.1,
-            pool=torch.randn(1 + B + B * T, HV, K, K, dtype=torch.float32) * 0.01,
+            pool=torch.randn(1 + B + B * T, HV, V, K, dtype=torch.float32) * 0.01,
             initial_idx=torch.arange(1, 1 + B, dtype=torch.int32),
             ssm_idx=torch.arange(1 + B, 1 + B + B * T, dtype=torch.int32).reshape(B, T),
             # output gate for the fused comparison: ONE tensor, so both sides
             # gate the same values. Drawn per real token; the vllm side expands
             # it, and the intermediate micro-steps it invents are discarded.
-            gate=torch.randn(B, T, HV, K, dtype=dtype) * 0.1,
-            norm_weight=torch.ones(K, dtype=dtype),
+            gate=torch.randn(B, T, HV, V, dtype=dtype) * 0.1,
+            norm_weight=torch.ones(V, dtype=dtype),
         )
 
 
@@ -114,13 +114,13 @@ def _repeat_to_hv(x, HQ, HV):
     return x if HQ == HV else x.repeat_interleave(HV // HQ, dim=-2)
 
 
-def _flashinfer_runner(t, B, T, n_h, HQ, HV, K, dtype, device):
+def _flashinfer_runner(t, B, T, n_h, HQ, HV, K, V, dtype, device):
     """Preallocated expansion scratch, refilled per call -- as serving does."""
     TN = T * n_h
-    out = torch.empty(B, T, HV, K, dtype=dtype, device=device)
+    out = torch.empty(B, T, HV, V, dtype=dtype, device=device)
     exp_q = torch.empty(B, TN, HQ, K, dtype=dtype, device=device) if n_h > 1 else None
     exp_a = torch.empty(B, TN, HV, dtype=dtype, device=device) if n_h > 1 else None
-    exp_o = torch.empty(B, TN, HV, K, dtype=dtype, device=device) if n_h > 1 else None
+    exp_o = torch.empty(B, TN, HV, V, dtype=dtype, device=device) if n_h > 1 else None
     mib = sum(
         x.numel() * x.element_size() for x in (exp_q, exp_a, exp_o) if x is not None
     ) / (1024**2)
@@ -149,7 +149,7 @@ def _flashinfer_runner(t, B, T, n_h, HQ, HV, K, dtype, device):
     return run, mib
 
 
-def _vllm_runner(t, B, T, n_h, HQ, HV, K, dtype, device):
+def _vllm_runner(t, B, T, n_h, HQ, HV, K, V, dtype, device):
     TN = T * n_h
     HE = HV if HQ != HV else HQ
     cu = torch.arange(0, B * TN + 1, TN, dtype=torch.int32, device=device)
@@ -174,7 +174,7 @@ def _vllm_runner(t, B, T, n_h, HQ, HV, K, dtype, device):
             dt_bias=t["dt_bias"],
             q=e_q.reshape(1, -1, HE, K),
             k=_repeat_to_hv(t["k"].flatten(1, 2), HQ, HV).reshape(1, -1, HE, K),
-            v=t["v"].flatten(1, 2).reshape(1, -1, HV, K),
+            v=t["v"].flatten(1, 2).reshape(1, -1, HV, V),
             scale=K**-0.5,
             initial_state=t["pool"],
             inplace_final_state=True,
@@ -183,7 +183,7 @@ def _vllm_runner(t, B, T, n_h, HQ, HV, K, dtype, device):
             num_accepted_tokens=accepted,
             use_qk_l2norm_in_kernel=True,
         )
-        return o.reshape(B, TN, HV, K)[:, n_h - 1 :: n_h]
+        return o.reshape(B, TN, HV, V)[:, n_h - 1 :: n_h]
 
     return run, 0.0
 
@@ -211,10 +211,10 @@ def _norm_gate(x, gate, out, weight, eps):
     )
 
 
-def _flashinfer_fused_runner(t, B, T, n_h, HQ, HV, K, dtype, device):
+def _flashinfer_fused_runner(t, B, T, n_h, HQ, HV, K, V, dtype, device):
     """flashinfer decode + the norm/gate their CUDA kernel fuses in."""
-    inner, mib = _flashinfer_runner(t, B, T, n_h, HQ, HV, K, dtype, device)
-    final = torch.empty(B, T, HV, K, dtype=dtype, device=device)
+    inner, mib = _flashinfer_runner(t, B, T, n_h, HQ, HV, K, V, dtype, device)
+    final = torch.empty(B, T, HV, V, dtype=dtype, device=device)
 
     def run():
         _norm_gate(inner(), t["gate"], final, t["norm_weight"], 1e-5)
@@ -223,7 +223,7 @@ def _flashinfer_fused_runner(t, B, T, n_h, HQ, HV, K, dtype, device):
     return run, mib
 
 
-def _vllm_fused_runner(t, B, T, n_h, HQ, HV, K, dtype, device):
+def _vllm_fused_runner(t, B, T, n_h, HQ, HV, K, V, dtype, device):
     """vLLM's fused CUDA kernel: unpack + decode + norm + gate, one launch.
 
     Takes mixed_qkv packed as [tokens, 2*key_dim + value_dim] post-conv, and a
@@ -231,7 +231,7 @@ def _vllm_fused_runner(t, B, T, n_h, HQ, HV, K, dtype, device):
     rollback, rather than the per-token scatter the other paths use.
     """
     TN = T * n_h
-    kd, vd = HQ * K, HV * K
+    kd, vd = HQ * K, HV * V
     mixed_qkv = torch.cat(
         [
             t["q"].new_zeros(B * TN, kd),
@@ -248,11 +248,11 @@ def _vllm_fused_runner(t, B, T, n_h, HQ, HV, K, dtype, device):
     # [N, S], not 1D: the kernel wants one column per spec token
     # (tests/kernels/mamba/test_gdn_fused_mtp.py builds torch.ones(1, SPEC_TOKENS)).
     state_idx_2d = t["initial_idx"][:, None].expand(B, TN).contiguous()
-    out = torch.empty(B * TN, HV, K, dtype=dtype, device=device)
+    out = torch.empty(B * TN, HV, V, dtype=dtype, device=device)
     # same gate as flashinfer at the real-token rows; intermediates are dropped
-    gate = torch.zeros(B, TN, HV, K, dtype=dtype, device=device)
+    gate = torch.zeros(B, TN, HV, V, dtype=dtype, device=device)
     gate[:, n_h - 1 :: n_h] = t["gate"]
-    gate = gate.reshape(B * TN, HV, K)
+    gate = gate.reshape(B * TN, HV, V)
 
     def run():
         # the vllm._custom_ops wrapper, not torch.ops._C directly: the raw op
@@ -282,21 +282,21 @@ def _vllm_fused_runner(t, B, T, n_h, HQ, HV, K, dtype, device):
     return run, 0.0
 
 
-def _runners(args, B, T, n_h, K, dtype):
+def _runners(args, B, T, n_h, K, V, dtype):
     """Build one runner per comparable column."""
     HQ, HV = args.num_q_heads, args.num_v_heads
     device = torch.device("cuda")
-    t = _make_inputs(B, T, n_h, HQ, HV, K, dtype, device, args.seed)
+    t = _make_inputs(B, T, n_h, HQ, HV, K, V, dtype, device, args.seed)
     # snapshot BEFORE the availability probe below, which mutates the pool
     t["pool_pristine"] = t["pool"].clone()
-    r = {"flashinfer": _flashinfer_runner(t, B, T, n_h, HQ, HV, K, dtype, device)}
+    r = {"flashinfer": _flashinfer_runner(t, B, T, n_h, HQ, HV, K, V, dtype, device)}
     if HAS_VLLM:
-        r["vllm"] = _vllm_runner(t, B, T, n_h, HQ, HV, K, dtype, device)
+        r["vllm"] = _vllm_runner(t, B, T, n_h, HQ, HV, K, V, dtype, device)
     if HAS_VLLM_FUSED:
         # The fused kernel's supported HV/H ratios are version-dependent (0.28.0
         # allows 1 only; {1,2,3,4,8} landed later), and it validates shapes
         # internally. Probe once rather than encode a version's rules.
-        fused = _vllm_fused_runner(t, B, T, n_h, HQ, HV, K, dtype, device)
+        fused = _vllm_fused_runner(t, B, T, n_h, HQ, HV, K, V, dtype, device)
         try:
             fused[0]()
             torch.cuda.synchronize()
@@ -322,7 +322,7 @@ def _configs(args):
             for n_h in args.num_householder:
                 for B in args.batch_size:
                     for T in args.draft_len:
-                        yield dt, K, n_h, B, T
+                        yield dt, K, args.v_head_size or K, n_h, B, T
 
 
 # Which columns are comparable with which. The fused pair includes the gated
@@ -336,8 +336,8 @@ _CHECK_GROUPS = [
 
 def _check(args):
     print("correctness check -- relative L2, within comparable groups")
-    for dt, K, n_h, B, T in _configs(args):
-        t, r = _runners(args, B, T, n_h, K, DTYPES[dt])
+    for dt, K, V, n_h, B, T in _configs(args):
+        t, r = _runners(args, B, T, n_h, K, V, DTYPES[dt])
         for label, ref_name, others in _CHECK_GROUPS:
             present = [n for n in others if n in r]
             if ref_name not in r or not present:
@@ -361,7 +361,7 @@ def _check(args):
                     f"{name}={rel:.4f}" + ("" if rel < 0.02 else " <-- MISMATCH")
                 )
             print(
-                f"  {dt:9s} D={K:3d} n_h={n_h} B={B:4d} T={T} "
+                f"  {dt:9s} K={K:3d} V={V:3d} n_h={n_h} B={B:4d} T={T} "
                 f"[{label} vs {ref_name}]: " + "  ".join(cols)
             )
 
@@ -371,7 +371,22 @@ def main():
         description="FlashInfer GDP decode vs vLLM's GDN kernel + the same expansion"
     )
     p.add_argument("--num-householder", type=int, nargs="+", default=[3])
-    p.add_argument("--head-size", type=int, nargs="+", choices=[64, 128], default=[128])
+    p.add_argument(
+        "--head-size",
+        type=int,
+        nargs="+",
+        choices=[64, 128],
+        default=[128],
+        help="K (query/key) head size",
+    )
+    p.add_argument(
+        "--v-head-size",
+        type=int,
+        choices=[64, 128],
+        default=None,
+        help="V head size when it differs from K (e.g. Qwen GDP: K=128, V=64). "
+        "Defaults to the K head size.",
+    )
     p.add_argument(
         "--draft-len",
         type=int,
@@ -415,14 +430,14 @@ def main():
         f"cold_l2={args.cold_l2} iters={args.iters}"
     )
     names = ["flashinfer"] + (["vllm"] if HAS_VLLM else [])
-    head = f"{'dtype':>9} {'D':>4} {'n_h':>4} {'batch':>6} {'T':>3}"
+    head = f"{'dtype':>9} {'K':>4} {'V':>4} {'n_h':>4} {'batch':>6} {'T':>3}"
     for n in names:
         head += f" {n + '(ms)':>16}"
     print(head + f" {'speedup':>9} {'scratch MiB':>12}")
 
-    for dt, K, n_h, B, T in _configs(args):
+    for dt, K, V, n_h, B, T in _configs(args):
         try:
-            t, r = _runners(args, B, T, n_h, K, DTYPES[dt])
+            t, r = _runners(args, B, T, n_h, K, V, DTYPES[dt])
             got = {
                 n: (
                     float(
@@ -442,11 +457,11 @@ def main():
             }
         except Exception as exc:  # keep the sweep going (OOM, unsupported config)
             print(
-                f"{dt:>9} {K:4d} {n_h:4d} {B:6d} {T:3d}   "
+                f"{dt:>9} {K:4d} {V:4d} {n_h:4d} {B:6d} {T:3d}   "
                 f"FAILED: {type(exc).__name__}: {exc}"
             )
             continue
-        line = f"{dt:>9} {K:4d} {n_h:4d} {B:6d} {T:3d}"
+        line = f"{dt:>9} {K:4d} {V:4d} {n_h:4d} {B:6d} {T:3d}"
         for n in names:
             line += f" {got[n][0]:16.4f}"
         line += (
