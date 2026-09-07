@@ -93,8 +93,6 @@ from typing import Optional, Type, Tuple
 import cuda.bindings.driver as cuda
 
 
-import os
-
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
@@ -238,16 +236,6 @@ class GatedDeltaNetChunkedKernel:
         self.store_final_state = store_final_state
         self.enable_checkpoints = enable_checkpoints
         self.is_persistent = is_persistent
-
-        # DEBUG (temporary, for the DV=64 correctness bug): force the M=128
-        # copy atoms even when M==64.  The M=64 branches select .16x32bx2 for
-        # a split-lane ((16,4)) TMEM layout; the A-operand staging variants of
-        # that are executed ONLY at DV=64 and have never been validated.
-        #   FI_GDN_WIDE_AOP=1  -> only the two A-operand staging sites
-        #   FI_GDN_WIDE_ALL=1  -> every M=64 site
-        _wide_all = os.environ.get("FI_GDN_WIDE_ALL", "0") == "1"
-        self._wide_all = _wide_all
-        self._wide_aop = _wide_all or os.environ.get("FI_GDN_WIDE_AOP", "0") == "1"
 
         # ------------------------------------------------------------------
         # Warp assignments  (12 warps total)
@@ -4007,7 +3995,7 @@ class GatedDeltaNetChunkedKernel:
         tCtState_mn_view = utils.gemm.sm100.transform_partitioned_tensor_layout(
             tCtState
         )
-        if cutlass.const_expr(self.mma_tiler_kv[0] == 64 and not self._wide_all):
+        if cutlass.const_expr(self.mma_tiler_kv[0] == 64):
             state_r2t_atom = cute.make_copy_atom(
                 tcgen05.copy.St16x32bx2Op(tcgen05.copy.Repetition(16)),
                 self.acc_dtype,
@@ -4136,7 +4124,7 @@ class GatedDeltaNetChunkedKernel:
         )
 
         # TMEM -> registers. D=64 exposes a split (16, 2) value mode.
-        if cutlass.const_expr(self.mma_tiler_kv[0] == 64 and not self._wide_all):
+        if cutlass.const_expr(self.mma_tiler_kv[0] == 64):
             atom_state_t2r = cute.make_copy_atom(
                 tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(16)),
                 self.acc_dtype,
@@ -4266,7 +4254,7 @@ class GatedDeltaNetChunkedKernel:
         tCcState = cute.make_identity_tensor(
             (self.mma_tiler_kv[0], self.mma_tiler_kv[1])
         )
-        if cutlass.const_expr(self.mma_tiler_kv[0] == 64 and not self._wide_all):
+        if cutlass.const_expr(self.mma_tiler_kv[0] == 64):
             atom_state_t2r = cute.make_copy_atom(
                 tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(16)),
                 self.acc_dtype,
@@ -4310,7 +4298,7 @@ class GatedDeltaNetChunkedKernel:
         tCcState_inp = cute.make_identity_tensor(
             (self.mma_tiler_qs[0], self.mma_tiler_qs[2])
         )
-        if cutlass.const_expr(self.mma_tiler_qs[0] == 64 and not self._wide_aop):
+        if cutlass.const_expr(self.mma_tiler_qs[0] == 64):
             atom_state_inp_r2t = cute.make_copy_atom(
                 tcgen05.copy.St16x32bx2Op(tcgen05.copy.Repetition(16)),
                 self.io_dtype,
@@ -4345,7 +4333,7 @@ class GatedDeltaNetChunkedKernel:
         tCcShared = cute.make_identity_tensor(
             (self.mma_tiler_qkv[0], self.mma_tiler_qkv[1])
         )
-        if cutlass.const_expr(self.mma_tiler_qkv[0] == 64 and not self._wide_all):
+        if cutlass.const_expr(self.mma_tiler_qkv[0] == 64):
             atom_shared_t2r = cute.make_copy_atom(
                 tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(16)),
                 self.acc_dtype,
@@ -4363,7 +4351,7 @@ class GatedDeltaNetChunkedKernel:
 
         # Keep a dedicated full-tile KS copy so it can be tuned independently
         # of the copy used by NV/decay_v reads.
-        if cutlass.const_expr(self.mma_tiler_qkv[0] == 64 and not self._wide_all):
+        if cutlass.const_expr(self.mma_tiler_qkv[0] == 64):
             atom_ks_t2r = cute.make_copy_atom(
                 tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(16)),
                 self.acc_dtype,
@@ -4395,7 +4383,7 @@ class GatedDeltaNetChunkedKernel:
         tCcShared_inp = cute.make_identity_tensor(
             (self.mma_tiler_qkv[0], self.mma_tiler_qkv[2])
         )
-        if cutlass.const_expr(self.mma_tiler_qkv[0] == 64 and not self._wide_aop):
+        if cutlass.const_expr(self.mma_tiler_qkv[0] == 64):
             atom_shared_inp_r2t = cute.make_copy_atom(
                 tcgen05.copy.St16x32bx2Op(tcgen05.copy.Repetition(16)), self.io_dtype
             )
@@ -4412,7 +4400,7 @@ class GatedDeltaNetChunkedKernel:
 
         # Keep a dedicated full-tile VKS copy so it can be tuned independently
         # of the copy used by NV/decay_v writes.
-        if cutlass.const_expr(self.mma_tiler_qkv[0] == 64 and not self._wide_all):
+        if cutlass.const_expr(self.mma_tiler_qkv[0] == 64):
             atom_vks_r2t = cute.make_copy_atom(
                 tcgen05.copy.St16x32bx2Op(tcgen05.copy.Repetition(16)),
                 self.io_dtype,
@@ -4440,7 +4428,7 @@ class GatedDeltaNetChunkedKernel:
         tCcQState = cute.make_identity_tensor(
             (self.mma_tiler_qs[0], self.mma_tiler_qs[1])
         )
-        if cutlass.const_expr(self.mma_tiler_qs[0] == 64 and not self._wide_all):
+        if cutlass.const_expr(self.mma_tiler_qs[0] == 64):
             atom_qs_t2r = cute.make_copy_atom(
                 tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(16)),
                 self.acc_dtype,
@@ -4480,7 +4468,7 @@ class GatedDeltaNetChunkedKernel:
         )
         thr_v_s2r = tiled_v_s2r.get_slice(cg1_tidx)
 
-        if cutlass.const_expr(self.mma_tiler_qs[0] == 64 and not self._wide_all):
+        if cutlass.const_expr(self.mma_tiler_qs[0] == 64):
             atom_o_t2r = cute.make_copy_atom(
                 tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(16)),
                 self.acc_dtype,
