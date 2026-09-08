@@ -2450,500 +2450,6 @@ class GatedDeltaNetChunkedKernel:
         )
 
     @cute.jit
-    def mma_issuer_warp(
-        self,
-        tmem_ptr: cutlass.Int64,
-        scheduler_params: GDNTileSchedulerParams,
-        block_coord: tuple,
-        grid_dim: tuple,
-        cu_seqlens: cute.Tensor,
-        mma_args: tuple,
-        smem_args: tuple,
-        pipeline_args: tuple,
-    ):
-        """Run the MMA issuer over its scheduler-owned work stream."""
-        (
-            cg0_shared_acc_producer,
-            cg1_shared_acc_producer,
-            q_state_acc_producer,
-            kv_acc_producer,
-            load_k_consumer,
-            load_q_consumer,
-            load_v_consumer,
-            a_inv_ready_consumer,
-            qk_ready_consumer,
-            state_inp_ready_consumer,
-            vks_ready_consumer,
-            nv_ready_consumer,
-            decay_v_ready_consumer,
-        ) = pipeline_args
-        load_k_releaser = load_k_consumer.clone()
-        load_q_releaser = load_q_consumer.clone()
-        scheduler = GDNTileScheduler.create(scheduler_params, block_coord, grid_dim)
-        work = scheduler.initial_work_tile_info()
-
-        while work.is_valid_tile:
-            batch_idx, _, _ = work.tile_idx
-            batch_start = cu_seqlens[batch_idx]
-            seqlen_b = cutlass.Int32(cu_seqlens[batch_idx + 1] - batch_start)
-            num_pairs_b = cute.ceil_div(seqlen_b, self.b_t * 2)
-            num_chunks_padded = num_pairs_b * 2
-            first_loop_chunk = 0
-
-            if cutlass.const_expr(not self.use_initial_state):
-                (
-                    cg0_shared_acc_producer,
-                    cg1_shared_acc_producer,
-                    q_state_acc_producer,
-                    kv_acc_producer,
-                    load_k_consumer,
-                    load_k_releaser,
-                    load_q_consumer,
-                    load_q_releaser,
-                    load_v_consumer,
-                    a_inv_ready_consumer,
-                    qk_ready_consumer,
-                    state_inp_ready_consumer,
-                    vks_ready_consumer,
-                    nv_ready_consumer,
-                    decay_v_ready_consumer,
-                ) = self.mma_warp_chunk(
-                    tmem_ptr,
-                    mma_args,
-                    smem_args,
-                    (
-                        cg0_shared_acc_producer,
-                        cg1_shared_acc_producer,
-                        q_state_acc_producer,
-                        kv_acc_producer,
-                        load_k_consumer,
-                        load_k_releaser,
-                        load_q_consumer,
-                        load_q_releaser,
-                        load_v_consumer,
-                        a_inv_ready_consumer,
-                        qk_ready_consumer,
-                        state_inp_ready_consumer,
-                        vks_ready_consumer,
-                        nv_ready_consumer,
-                        decay_v_ready_consumer,
-                    ),
-                    (0, num_pairs_b, True),
-                )
-                first_loop_chunk = 1
-
-            for chunk_iter in cutlass.range(first_loop_chunk, num_chunks_padded):
-                loop_is_first_chunk = False
-                if cutlass.const_expr(self.use_initial_state):
-                    loop_is_first_chunk = chunk_iter == 0
-                (
-                    cg0_shared_acc_producer,
-                    cg1_shared_acc_producer,
-                    q_state_acc_producer,
-                    kv_acc_producer,
-                    load_k_consumer,
-                    load_k_releaser,
-                    load_q_consumer,
-                    load_q_releaser,
-                    load_v_consumer,
-                    a_inv_ready_consumer,
-                    qk_ready_consumer,
-                    state_inp_ready_consumer,
-                    vks_ready_consumer,
-                    nv_ready_consumer,
-                    decay_v_ready_consumer,
-                ) = self.mma_warp_chunk(
-                    tmem_ptr,
-                    mma_args,
-                    smem_args,
-                    (
-                        cg0_shared_acc_producer,
-                        cg1_shared_acc_producer,
-                        q_state_acc_producer,
-                        kv_acc_producer,
-                        load_k_consumer,
-                        load_k_releaser,
-                        load_q_consumer,
-                        load_q_releaser,
-                        load_v_consumer,
-                        a_inv_ready_consumer,
-                        qk_ready_consumer,
-                        state_inp_ready_consumer,
-                        vks_ready_consumer,
-                        nv_ready_consumer,
-                        decay_v_ready_consumer,
-                    ),
-                    (chunk_iter, num_pairs_b, loop_is_first_chunk),
-                )
-
-            scheduler.advance_to_next_work()
-            work = scheduler.get_current_work()
-
-        cg0_shared_acc_producer.tail()
-        cg1_shared_acc_producer.tail()
-        q_state_acc_producer.tail()
-        kv_acc_producer.tail()
-
-    @cute.jit
-    def mma_warp_chunk(
-        self,
-        tmem_ptr: cutlass.Int64,
-        mma_args: tuple,
-        smem_args: tuple,
-        pipeline_args: tuple,
-        work_args: tuple,
-    ) -> tuple[
-        pipeline.PipelineProducer,
-        pipeline.PipelineProducer,
-        pipeline.PipelineProducer,
-        pipeline.PipelineProducer,
-        pipeline.PipelineConsumer,
-        pipeline.PipelineConsumer,
-        pipeline.PipelineConsumer,
-        pipeline.PipelineConsumer,
-        pipeline.PipelineConsumer,
-        pipeline.PipelineConsumer,
-        pipeline.PipelineConsumer,
-        pipeline.PipelineConsumer,
-        pipeline.PipelineConsumer,
-        pipeline.PipelineConsumer,
-        pipeline.PipelineConsumer,
-    ]:
-        """Warp 8: process one chunk from the caller-owned chunk stream.
-
-        The next KK0/KK1 are issued after current NV0 so their MMA latency
-        overlaps current QKV0/KV0 and chunk-1 work. CG0 and CG1 accumulators
-        use disjoint two-stage rings, so the lookahead cannot alias KS/NV.
-        """
-        tiled_mma_qk, tiled_mma_qs, tiled_mma_qkv, tiled_mma_qkv_ss, tiled_mma_kv = (
-            mma_args
-        )
-        sQ, sK, sK_trans, sV, sAinv, sQk = smem_args
-        (
-            cg0_shared_acc_producer,
-            cg1_shared_acc_producer,
-            q_state_acc_producer,
-            kv_acc_producer,
-            load_k_consumer,
-            load_k_releaser,
-            load_q_consumer,
-            load_q_releaser,
-            load_v_consumer,
-            a_inv_ready_consumer,
-            qk_ready_consumer,
-            state_inp_ready_consumer,
-            vks_ready_consumer,
-            nv_ready_consumer,
-            decay_v_ready_consumer,
-        ) = pipeline_args
-        chunk_iter, num_pairs_b, is_first_chunk = work_args
-
-        # ------------------------------------------------------------------
-        # Build TMEM accumulator views  (identical to mma_warp)
-        # ------------------------------------------------------------------
-        acc_shape = tiled_mma_qkv.partition_shape_C(
-            (self.mma_tiler_qkv[0], self.mma_tiler_qkv[1])
-        )
-        tCtCg0Shared_fake = tiled_mma_qkv.make_fragment_C(
-            cute.append(acc_shape, self.tmem_cg0_shared_acc_stages)
-        )
-        tCtCg0Shared = cute.make_tensor(
-            tmem_ptr + self.tmem_cg0_shared_acc_offset, tCtCg0Shared_fake.layout
-        )
-        tCtCg1Shared_fake = tiled_mma_qkv.make_fragment_C(
-            cute.append(acc_shape, self.tmem_cg1_shared_acc_stages)
-        )
-        tCtCg1Shared = cute.make_tensor(
-            tmem_ptr + self.tmem_cg1_shared_acc_offset, tCtCg1Shared_fake.layout
-        )
-
-        shared_inp_shape = tiled_mma_qkv.partition_shape_A(
-            (self.mma_tiler_qkv[0], self.mma_tiler_qkv[2])
-        )
-        tCtShared_inp_fake = tiled_mma_qkv.make_fragment_A(
-            cute.append(shared_inp_shape, self.tmem_shared_inp_stages)
-        )
-        tCtShared_inp = cute.make_tensor(
-            cute.recast_ptr(
-                tmem_ptr + self.tmem_shared_inp_offset, dtype=self.io_dtype
-            ),
-            tCtShared_inp_fake.layout,
-        )
-
-        qs_acc_shape = tiled_mma_qs.partition_shape_C(
-            (self.mma_tiler_qs[0], self.mma_tiler_qs[1])
-        )
-        tCtQState_fake = tiled_mma_qs.make_fragment_C(
-            cute.append(qs_acc_shape, self.tmem_q_state_acc_stages)
-        )
-        tCtQState = cute.make_tensor(
-            tmem_ptr + self.tmem_q_state_offset, tCtQState_fake.layout
-        )
-
-        state_acc_shape = tiled_mma_kv.partition_shape_C(
-            (self.mma_tiler_kv[0], self.mma_tiler_kv[1])
-        )
-        tCtState_fake = tiled_mma_kv.make_fragment_C(
-            cute.append(state_acc_shape, self.tmem_kv_acc_stages)
-        )
-        tCtState = cute.make_tensor(
-            tmem_ptr + self.tmem_state_offset, tCtState_fake.layout
-        )
-
-        state_inp_shape = tiled_mma_qs.partition_shape_A(
-            (self.mma_tiler_qs[0], self.mma_tiler_qs[2])
-        )
-        tCtState_inp_fake = tiled_mma_qs.make_fragment_A(
-            cute.append(state_inp_shape, self.tmem_state_inp_stages)
-        )
-        tCtState_inp = cute.make_tensor(
-            cute.recast_ptr(tmem_ptr + self.tmem_state_inp_offset, dtype=self.io_dtype),
-            tCtState_inp_fake.layout,
-        )
-
-        # ------------------------------------------------------------------
-        # Pre-create operand fragments
-        # ------------------------------------------------------------------
-        tCrK_A = tiled_mma_qk.make_fragment_A(sK)
-        tCrK_B = tiled_mma_qk.make_fragment_B(sK)
-        tCrQ_A = tiled_mma_qk.make_fragment_A(sQ)
-        tCrS_A = tCtState_inp
-        tCrQ_B_qs = tiled_mma_qs.make_fragment_B(sQ)
-        tCrK_B_qs = tiled_mma_qs.make_fragment_B(sK)
-        tCrAinv_B = tiled_mma_qkv.make_fragment_B(sAinv)
-        tCrQkv_A = tCtShared_inp
-        tCrNv_B = tiled_mma_qkv.make_fragment_B(sQk)
-        tCrDecayV_A = tCtShared_inp
-        tCrKt_B = tiled_mma_kv.make_fragment_B(sK_trans)
-
-        # The first no-state pair reads V directly from SMEM; later pairs read
-        # the state-corrected VKS operand from TMEM.
-        tCrV_A_0_ss = tiled_mma_qkv_ss.make_fragment_A(sV)
-
-        num_kphases = cute.size(tCrK_A, mode=[2])
-        num_kphases_qs = cute.size(tCrS_A, mode=[2])
-        num_kphases_qkv = cute.size(tCrAinv_B, mode=[2])
-        num_kphases_kv = cute.size(tCrKt_B, mode=[2])
-
-        # Pair membership is derived from the caller-provided chunk index.
-        is_pair_first = (chunk_iter & 1) == 0
-        has_next_pair = chunk_iter < num_pairs_b * 2 - 2
-
-        # Both KK/QK accumulators must precede chunk 0 because CG0 builds
-        # the pair inverse from KK0/KK1 before MMA can consume Ainv0.
-        if is_pair_first:
-            k0_cursor = load_k_releaser.clone()
-            k0_ready_handle = k0_cursor.current_handle()
-            k1_cursor = k0_cursor.clone()
-            k1_cursor.advance()
-            k1_ready_handle = k1_cursor.current_handle()
-
-            if is_first_chunk:
-                kk0_handle = cg0_shared_acc_producer.acquire_and_advance()
-                k0_ready_handle = load_k_consumer.wait_and_advance()
-                for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
-                    tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
-                    cute.gemm(
-                        tiled_mma_qk,
-                        tCtCg0Shared[None, None, None, kk0_handle.index],
-                        tCrK_A[None, None, kphase_idx, k0_ready_handle.index],
-                        tCrK_B[None, None, kphase_idx, k0_ready_handle.index],
-                        tCtCg0Shared[None, None, None, kk0_handle.index],
-                    )
-                kk0_handle.commit()
-
-                kk1_handle = cg0_shared_acc_producer.acquire_and_advance()
-                k1_ready_handle = load_k_consumer.wait_and_advance()
-                for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
-                    tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
-                    cute.gemm(
-                        tiled_mma_qk,
-                        tCtCg0Shared[None, None, None, kk1_handle.index],
-                        tCrK_A[None, None, kphase_idx, k1_ready_handle.index],
-                        tCrK_B[None, None, kphase_idx, k1_ready_handle.index],
-                        tCtCg0Shared[None, None, None, kk1_handle.index],
-                    )
-                kk1_handle.commit()
-
-            qk0_handle = cg0_shared_acc_producer.acquire_and_advance()
-            q0_ready_handle = load_q_consumer.wait_and_advance()
-            for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
-                tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
-                cute.gemm(
-                    tiled_mma_qk,
-                    tCtCg0Shared[None, None, None, qk0_handle.index],
-                    tCrQ_A[None, None, kphase_idx, q0_ready_handle.index],
-                    tCrK_B[None, None, kphase_idx, k0_ready_handle.index],
-                    tCtCg0Shared[None, None, None, qk0_handle.index],
-                )
-            qk0_handle.commit()
-
-            qk1_handle = cg0_shared_acc_producer.acquire_and_advance()
-            q1_ready_handle = load_q_consumer.wait_and_advance()
-            for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
-                tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
-                cute.gemm(
-                    tiled_mma_qk,
-                    tCtCg0Shared[None, None, None, qk1_handle.index],
-                    tCrQ_A[None, None, kphase_idx, q1_ready_handle.index],
-                    tCrK_B[None, None, kphase_idx, k1_ready_handle.index],
-                    tCtCg0Shared[None, None, None, qk1_handle.index],
-                )
-            qk1_handle.commit()
-
-        k_release_handle = load_k_releaser.current_handle()
-        q_release_handle = load_q_releaser.current_handle()
-        k_stage = k_release_handle.index
-        q_stage = q_release_handle.index
-
-        valid_state = is_first_chunk == False  # noqa: E712
-        if cutlass.const_expr(self.use_initial_state):
-            valid_state = True
-
-        if valid_state:
-            ks_handle = cg1_shared_acc_producer.acquire_and_advance()
-            state_handle = state_inp_ready_consumer.wait_and_advance()
-            for kphase_idx in cutlass.range(num_kphases_qs, unroll_full=True):
-                tiled_mma_qs.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
-                cute.gemm(
-                    tiled_mma_qs,
-                    tCtCg1Shared[None, None, None, ks_handle.index],
-                    tCrS_A[None, None, kphase_idx, state_handle.index],
-                    tCrK_B_qs[None, None, kphase_idx, k_stage],
-                    tCtCg1Shared[None, None, None, ks_handle.index],
-                )
-            ks_handle.commit()
-
-            qs_handle = q_state_acc_producer.acquire_and_advance()
-            for kphase_idx in cutlass.range(num_kphases_qs, unroll_full=True):
-                tiled_mma_qs.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
-                cute.gemm(
-                    tiled_mma_qs,
-                    tCtQState[None, None, None, qs_handle.index],
-                    tCrS_A[None, None, kphase_idx, state_handle.index],
-                    tCrQ_B_qs[None, None, kphase_idx, q_stage],
-                    tCtQState[None, None, None, qs_handle.index],
-                )
-            qs_handle.commit()
-            state_handle.release()
-
-        q_release_handle.release()
-        load_q_releaser.advance()
-
-        nv_handle = cg1_shared_acc_producer.acquire_and_advance()
-        vks_ready_consumer.wait_and_advance()
-        ainv_handle = a_inv_ready_consumer.wait_and_advance()
-        if valid_state:
-            for kphase_idx in cutlass.range(num_kphases_qkv, unroll_full=True):
-                tiled_mma_qkv.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
-                cute.gemm(
-                    tiled_mma_qkv,
-                    tCtCg1Shared[None, None, None, nv_handle.index],
-                    tCtShared_inp[None, None, kphase_idx, 0],
-                    tCrAinv_B[None, None, kphase_idx, ainv_handle.index],
-                    tCtCg1Shared[None, None, None, nv_handle.index],
-                )
-        else:
-            for kphase_idx in cutlass.range(num_kphases_qkv, unroll_full=True):
-                tiled_mma_qkv_ss.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
-                cute.gemm(
-                    tiled_mma_qkv_ss,
-                    tCtCg1Shared[None, None, None, nv_handle.index],
-                    tCrV_A_0_ss[None, None, kphase_idx, 0],
-                    tCrAinv_B[None, None, kphase_idx, ainv_handle.index],
-                    tCtCg1Shared[None, None, None, nv_handle.index],
-                )
-        nv_handle.commit()
-        ainv_handle.release()
-
-        # Preserve the mid-pair lookahead after NV0. The two successor KKs
-        # are explicit operations, not a nested pair/chunk loop.
-        if is_pair_first:
-            if has_next_pair:
-                pf_kk0_handle = cg0_shared_acc_producer.acquire_and_advance()
-                pf_k0_handle = load_k_consumer.wait_and_advance()
-                for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
-                    tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
-                    cute.gemm(
-                        tiled_mma_qk,
-                        tCtCg0Shared[None, None, None, pf_kk0_handle.index],
-                        tCrK_A[None, None, kphase_idx, pf_k0_handle.index],
-                        tCrK_B[None, None, kphase_idx, pf_k0_handle.index],
-                        tCtCg0Shared[None, None, None, pf_kk0_handle.index],
-                    )
-                pf_kk0_handle.commit()
-
-                pf_kk1_handle = cg0_shared_acc_producer.acquire_and_advance()
-                pf_k1_handle = load_k_consumer.wait_and_advance()
-                for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
-                    tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
-                    cute.gemm(
-                        tiled_mma_qk,
-                        tCtCg0Shared[None, None, None, pf_kk1_handle.index],
-                        tCrK_A[None, None, kphase_idx, pf_k1_handle.index],
-                        tCrK_B[None, None, kphase_idx, pf_k1_handle.index],
-                        tCtCg0Shared[None, None, None, pf_kk1_handle.index],
-                    )
-                pf_kk1_handle.commit()
-
-        q_state_handle = q_state_acc_producer.acquire_and_advance()
-        qkv_qk_handle = qk_ready_consumer.wait_and_advance()
-        nv_ready_consumer.wait_and_advance()
-        for kphase_idx in cutlass.range(num_kphases_qkv, unroll_full=True):
-            if valid_state:
-                tiled_mma_qkv.set(tcgen05.Field.ACCUMULATE, True)
-            else:
-                tiled_mma_qkv.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
-            cute.gemm(
-                tiled_mma_qkv,
-                tCtQState[None, None, None, q_state_handle.index],
-                tCrQkv_A[None, None, kphase_idx, 0],
-                tCrNv_B[None, None, kphase_idx, qkv_qk_handle.index],
-                tCtQState[None, None, None, q_state_handle.index],
-            )
-        qkv_qk_handle.release()
-        q_state_handle.commit()
-
-        if cutlass.const_expr(self.use_initial_state):
-            if is_first_chunk:
-                kv_acc_producer.advance()
-        kv_handle = kv_acc_producer.acquire_and_advance()
-        decay_v_ready_consumer.wait_and_advance()
-        for kphase_idx in cutlass.range(num_kphases_kv, unroll_full=True):
-            if valid_state:
-                tiled_mma_kv.set(tcgen05.Field.ACCUMULATE, True)
-            else:
-                tiled_mma_kv.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
-            cute.gemm(
-                tiled_mma_kv,
-                tCtState[None, None, None, kv_handle.index],
-                tCrDecayV_A[None, None, kphase_idx, 1],
-                tCrKt_B[None, None, kphase_idx, k_stage],
-                tCtState[None, None, None, kv_handle.index],
-            )
-        kv_handle.commit()
-        k_release_handle.release()
-        load_k_releaser.advance()
-
-        return (
-            cg0_shared_acc_producer,
-            cg1_shared_acc_producer,
-            q_state_acc_producer,
-            kv_acc_producer,
-            load_k_consumer,
-            load_k_releaser,
-            load_q_consumer,
-            load_q_releaser,
-            load_v_consumer,
-            a_inv_ready_consumer,
-            qk_ready_consumer,
-            state_inp_ready_consumer,
-            vks_ready_consumer,
-            nv_ready_consumer,
-            decay_v_ready_consumer,
-        )
-
-    @cute.jit
     def compute_group_0_pair(
         self,
         tidx: cutlass.Int32,
@@ -3997,7 +3503,7 @@ class GatedDeltaNetChunkedKernel:
         )
         if cutlass.const_expr(self.mma_tiler_kv[0] == 64):
             state_r2t_atom = cute.make_copy_atom(
-                tcgen05.copy.St16x32bx2Op(tcgen05.copy.Repetition(16)),
+                tcgen05.copy.St16x256bOp(tcgen05.copy.Repetition(8)),
                 self.acc_dtype,
             )
             tCtState_for_r2t = tCtState_mn_view[None, None, 0]
@@ -4106,6 +3612,18 @@ class GatedDeltaNetChunkedKernel:
         num_threads_cg1 = self.threads_per_warp * len(self.compute_group_1_warp_ids)
         cg1_tidx = tidx % num_threads_cg1
 
+        # M=64 fp32 TMEM atoms are the 16x256b family.  CUTLASS's selector
+        # (sm100_get_tmem_load_op) also offers 16dp128b for an N-major
+        # destination, but that is the 'stmatrix_n' variant: at M=64 its
+        # register fragment has a size-2 stride-0 (broadcast) mode because 16
+        # datapaths are shared by 32 threads, so it requires shfl/predication
+        # rather than a plain vectorized copy.  16dp32b is listed only as a
+        # commented-out
+        # alternative; no other kernel in flashinfer, cuDNN, the CuTe-DSL
+        # helpers or the CUTLASS examples passes 16x32bx2 to make_tmem_copy.
+        # Loads and stores must stay in the same family with matching
+        # Repetition (cf. blackwell/blockwise_gemm), which is why no
+        # hand-derived repetition halving is needed here.
         # Build state TMEM layout (mirrors compute_group_1 setup)
         state_acc_shape = tiled_mma_kv.partition_shape_C(
             (self.mma_tiler_kv[0], self.mma_tiler_kv[1])
@@ -4126,7 +3644,7 @@ class GatedDeltaNetChunkedKernel:
         # TMEM -> registers. D=64 exposes a split (16, 2) value mode.
         if cutlass.const_expr(self.mma_tiler_kv[0] == 64):
             atom_state_t2r = cute.make_copy_atom(
-                tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(16)),
+                tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)),
                 self.acc_dtype,
             )
             tCtState_for_t2r = tCtState_mn_view[None, None, 0]
@@ -4136,6 +3654,18 @@ class GatedDeltaNetChunkedKernel:
             )
             tCtState_for_t2r = tCtState[(None, None), 0, 0, 0]
         tiled_state_t2r = tcgen05.make_tmem_copy(atom_state_t2r, tCtState_for_t2r)
+        # Register->GMEM copy DERIVED from the TMEM->register copy, as CUTLASS's
+        # no-SMEM SM100 epilogue does:
+        #     tiled_r2g = make_tiled_copy_D(Copy_Atom<SM100_STORE_...>{}, tiled_t2r)
+        # (sm100_epilogue_nosmem.hpp).  Partitioning GMEM straight off the t2r
+        # copy re-derives the thread mapping from the register side; at M=64 the
+        # split-lane (16,4) layout makes that disagree with the TMEM side.  At
+        # M=128 the layout is flat and both agree, so only head_size=64 is hit.
+        atom_state_r2g = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), self.state_dtype
+        )
+        tiled_state_r2g = cute.make_tiled_copy_D(atom_state_r2g, tiled_state_t2r)
+        thr_state_r2g = tiled_state_r2g.get_slice(cg1_tidx)
         thr_state_t2r = tiled_state_t2r.get_slice(cg1_tidx)
         tTR_tCtState = thr_state_t2r.partition_S(tCtState_mn_view)
         tTR_tCcState = thr_state_t2r.partition_D(tCcState)
@@ -4161,11 +3691,18 @@ class GatedDeltaNetChunkedKernel:
                 if seqlen_b % checkpoint_every_n_tokens == 0:
                     num_valid_chunks_b = cute.ceil_div(seqlen_b, self.b_t)
                     if num_valid_chunks_b % 2 == 0:
-                        gS_checkpoints = cute.flat_divide(
-                            mS_checkpoints[None, None, head_idx, checkpoint_offset],
-                            (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
-                        )[None, None, 0, 0]
-                        tSgCheckpoints = thr_state_t2r.partition_D(gS_checkpoints)
+                        # See the state store below: GMEM goes through the MMA's
+                        # C partition before partition_D.
+                        gS_checkpoints = (
+                            utils.gemm.sm100.transform_partitioned_tensor_layout(
+                                tiled_mma_kv.get_slice(0).partition_C(
+                                    mS_checkpoints[
+                                        None, None, head_idx, checkpoint_offset
+                                    ]
+                                )
+                            )
+                        )
+                        tSgCheckpoints = thr_state_r2g.partition_D(gS_checkpoints)
                         cute.autovec_copy(
                             tRG_rState[None, 0, sub],
                             tSgCheckpoints[None, 0, sub],
@@ -4176,10 +3713,19 @@ class GatedDeltaNetChunkedKernel:
                     state_row = cutlass.Int32(mS_indices[batch_idx])
                 else:
                     state_row = batch_idx
-                gS_out = cute.flat_divide(
-                    mS_out[None, None, head_idx, state_row],
-                    (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
-                )[None, None, 0, 0]
+                # Partition GMEM through the MMA's C partition before the copy's
+                # partition_D, as every working SM100 epilogue does
+                # (CuTeDSL blackwell/dense_gemm.py: thr_mma.partition_C(gC) ->
+                # flat_divide(epi_tile) -> thr_copy_t2r.partition_D).  partition_C
+                # introduces the MMA's hierarchical ((16,4), N) C mode; handing
+                # partition_D a raw flat (M, N) tile loses it, and at M=64 the
+                # split-lane layout then yields wrong per-thread coordinates.
+                # At M=128 the C mode is flat, so the raw tile happened to work.
+                gS_out = utils.gemm.sm100.transform_partitioned_tensor_layout(
+                    tiled_mma_kv.get_slice(0).partition_C(
+                        mS_out[None, None, head_idx, state_row]
+                    )
+                )
                 tRG_tCgState = thr_state_t2r.partition_D(gS_out)
                 cute.autovec_copy(
                     tRG_rState[None, 0, sub],
@@ -4256,11 +3802,11 @@ class GatedDeltaNetChunkedKernel:
         )
         if cutlass.const_expr(self.mma_tiler_kv[0] == 64):
             atom_state_t2r = cute.make_copy_atom(
-                tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(16)),
+                tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)),
                 self.acc_dtype,
             )
             atom_state_r2t = cute.make_copy_atom(
-                tcgen05.copy.St16x32bx2Op(tcgen05.copy.Repetition(16)),
+                tcgen05.copy.St16x256bOp(tcgen05.copy.Repetition(8)),
                 self.acc_dtype,
             )
             tCtState_for_t2r = tCtState_mn_view[None, None, 0]
@@ -4273,6 +3819,18 @@ class GatedDeltaNetChunkedKernel:
             )
             tCtState_for_t2r = tCtState[(None, None), 0, 0, 0]
         tiled_state_t2r = tcgen05.make_tmem_copy(atom_state_t2r, tCtState_for_t2r)
+        # Register->GMEM copy DERIVED from the TMEM->register copy, as CUTLASS's
+        # no-SMEM SM100 epilogue does:
+        #     tiled_r2g = make_tiled_copy_D(Copy_Atom<SM100_STORE_...>{}, tiled_t2r)
+        # (sm100_epilogue_nosmem.hpp).  Partitioning GMEM straight off the t2r
+        # copy re-derives the thread mapping from the register side; at M=64 the
+        # split-lane (16,4) layout makes that disagree with the TMEM side.  At
+        # M=128 the layout is flat and both agree, so only head_size=64 is hit.
+        atom_state_r2g = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), self.state_dtype
+        )
+        tiled_state_r2g = cute.make_tiled_copy_D(atom_state_r2g, tiled_state_t2r)
+        thr_state_r2g = tiled_state_r2g.get_slice(cg1_tidx)
         tiled_state_r2t = tcgen05.make_tmem_copy(atom_state_r2t, tCtState_for_t2r)
         thr_state_t2r = tiled_state_t2r.get_slice(cg1_tidx)
         thr_state_r2t = tiled_state_r2t.get_slice(cg1_tidx)
@@ -4299,11 +3857,23 @@ class GatedDeltaNetChunkedKernel:
             (self.mma_tiler_qs[0], self.mma_tiler_qs[2])
         )
         if cutlass.const_expr(self.mma_tiler_qs[0] == 64):
+            # This store's register-side value layout must EQUAL the layout of
+            # the state accumulator read (atom_state_t2r), because the staged
+            # fragment tRT_rState_inp is filled from tTR_rState by a whole-
+            # tensor .store(.load()), which pairs the two by element index.
+            # Equal element counts are not sufficient: St16x256b(Rep 4) also
+            # carries 32 elements/thread at M=64, but lays them out
+            # (4,2,4):(1@1,8@0,16@1) while the paired Ld16x256b(Rep 8) fp32
+            # read gives (2,2,8):(1@1,8@0,8@1).  Element i then carries
+            # accumulator row 8*((i//2)%2) but is stored at row 8*((i//4)%2),
+            # so half of each thread's rows land on the wrong M row.
+            # St16x128b(Rep 8) reproduces the read's layout exactly.
             atom_state_inp_r2t = cute.make_copy_atom(
-                tcgen05.copy.St16x32bx2Op(tcgen05.copy.Repetition(16)),
+                tcgen05.copy.St16x128bOp(tcgen05.copy.Repetition(8)),
                 self.io_dtype,
             )
         else:
+            # Pairs with Ld32x32b(Rep 32); both give ((32,1),1,4) at M=128.
             atom_state_inp_r2t = cute.make_copy_atom(
                 tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)), self.io_dtype
             )
@@ -4333,17 +3903,15 @@ class GatedDeltaNetChunkedKernel:
         tCcShared = cute.make_identity_tensor(
             (self.mma_tiler_qkv[0], self.mma_tiler_qkv[1])
         )
-        if cutlass.const_expr(self.mma_tiler_qkv[0] == 64):
-            atom_shared_t2r = cute.make_copy_atom(
-                tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(16)),
-                self.acc_dtype,
-            )
-            tCtShared_for_t2r = tCtShared_mn_view[None, None, 0]
-        else:
-            atom_shared_t2r = cute.make_copy_atom(
-                tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)), self.acc_dtype
-            )
-            tCtShared_for_t2r = tCtShared[(None, None), 0, 0, 0]
+        # Ld16x256b(Rep 8) is layout-correct at M=64 and M=128 alike (it is what
+        # atom_shared_inp_r2t's St16x128b(Rep 8) is matched against), so this
+        # needs no M-dependent branch.  The mn_view slice and the raw
+        # tCtShared[(None, None), 0, 0, 0] slice yield identical tiled copies;
+        # the mn_view form is kept because it names the (M, N) axes explicitly.
+        atom_shared_t2r = cute.make_copy_atom(
+            tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)), self.acc_dtype
+        )
+        tCtShared_for_t2r = tCtShared_mn_view[None, None, 0]
         tiled_shared_t2r = tcgen05.make_tmem_copy(atom_shared_t2r, tCtShared_for_t2r)
         thr_shared_t2r = tiled_shared_t2r.get_slice(cg1_tidx)
         tTR_tCtShared = thr_shared_t2r.partition_S(tCtShared_mn_view)
@@ -4351,15 +3919,9 @@ class GatedDeltaNetChunkedKernel:
 
         # Keep a dedicated full-tile KS copy so it can be tuned independently
         # of the copy used by NV/decay_v reads.
-        if cutlass.const_expr(self.mma_tiler_qkv[0] == 64):
-            atom_ks_t2r = cute.make_copy_atom(
-                tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(16)),
-                self.acc_dtype,
-            )
-        else:
-            atom_ks_t2r = cute.make_copy_atom(
-                tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)), self.acc_dtype
-            )
+        atom_ks_t2r = cute.make_copy_atom(
+            tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)), self.acc_dtype
+        )
         tiled_ks_t2r = tcgen05.make_tmem_copy(atom_ks_t2r, tCtShared_for_t2r)
         thr_ks_t2r = tiled_ks_t2r.get_slice(cg1_tidx)
         tTR_tCtKS = thr_ks_t2r.partition_S(tCtShared_mn_view)
@@ -4383,14 +3945,20 @@ class GatedDeltaNetChunkedKernel:
         tCcShared_inp = cute.make_identity_tensor(
             (self.mma_tiler_qkv[0], self.mma_tiler_qkv[2])
         )
-        if cutlass.const_expr(self.mma_tiler_qkv[0] == 64):
-            atom_shared_inp_r2t = cute.make_copy_atom(
-                tcgen05.copy.St16x32bx2Op(tcgen05.copy.Repetition(16)), self.io_dtype
-            )
-        else:
-            atom_shared_inp_r2t = cute.make_copy_atom(
-                tcgen05.copy.St16x128bOp(tcgen05.copy.Repetition(8)), self.io_dtype
-            )
+        # The register-side value layout of this store must EQUAL the layout of
+        # the NV/decay_v accumulator read (atom_shared_t2r), because the staged
+        # fragment tTR_rNv_inp is shaped from that read via
+        # make_rmem_tensor_like, so the two are paired by element index.
+        # Equal element counts are not sufficient: at M=64 St16x256b(Rep 4)
+        # also carries 32 elements/thread but lays them out
+        # (4,2,4):(1@1,8@0,16@1) while the paired Ld16x256b(Rep 8) fp32 read
+        # gives (2,2,8):(1@1,8@0,8@1) -- element i carries accumulator row
+        # 8*((i//2)%2) yet is stored at row 8*((i//4)%2), so half of every
+        # thread's rows land on the wrong M row.  St16x128b(Rep 8) reproduces
+        # the read's layout at M=64 and M=128 alike, so no branch is needed.
+        atom_shared_inp_r2t = cute.make_copy_atom(
+            tcgen05.copy.St16x128bOp(tcgen05.copy.Repetition(8)), self.io_dtype
+        )
         tCtShared_inp_for_r2t = tCtShared_inp_mn_view[None, None, 0]
         tiled_shared_inp_r2t = tcgen05.make_tmem_copy(
             atom_shared_inp_r2t, tCtShared_inp_for_r2t
@@ -4400,15 +3968,10 @@ class GatedDeltaNetChunkedKernel:
 
         # Keep a dedicated full-tile VKS copy so it can be tuned independently
         # of the copy used by NV/decay_v writes.
-        if cutlass.const_expr(self.mma_tiler_qkv[0] == 64):
-            atom_vks_r2t = cute.make_copy_atom(
-                tcgen05.copy.St16x32bx2Op(tcgen05.copy.Repetition(16)),
-                self.io_dtype,
-            )
-        else:
-            atom_vks_r2t = cute.make_copy_atom(
-                tcgen05.copy.St16x128bOp(tcgen05.copy.Repetition(8)), self.io_dtype
-            )
+        # Same layout-matching requirement as atom_shared_inp_r2t above.
+        atom_vks_r2t = cute.make_copy_atom(
+            tcgen05.copy.St16x128bOp(tcgen05.copy.Repetition(8)), self.io_dtype
+        )
         tiled_vks_r2t = tcgen05.make_tmem_copy(atom_vks_r2t, tCtShared_inp_for_r2t)
         thr_vks_r2t = tiled_vks_r2t.get_slice(cg1_tidx)
         tRT_tCtVKS_inp = thr_vks_r2t.partition_D(tCtShared_inp_mn_view)
@@ -4428,26 +3991,16 @@ class GatedDeltaNetChunkedKernel:
         tCcQState = cute.make_identity_tensor(
             (self.mma_tiler_qs[0], self.mma_tiler_qs[1])
         )
-        if cutlass.const_expr(self.mma_tiler_qs[0] == 64):
-            atom_qs_t2r = cute.make_copy_atom(
-                tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(16)),
-                self.acc_dtype,
-            )
-            atom_qs_r2t = cute.make_copy_atom(
-                tcgen05.copy.St16x32bx2Op(tcgen05.copy.Repetition(16)),
-                self.acc_dtype,
-            )
-            tCtQState_for_t2r = tCtQState_mn_view[None, None, 0]
-            tCtQState_for_r2t = tCtQState_mn_view[None, None, 0]
-        else:
-            atom_qs_t2r = cute.make_copy_atom(
-                tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)), self.acc_dtype
-            )
-            atom_qs_r2t = cute.make_copy_atom(
-                tcgen05.copy.St16x256bOp(tcgen05.copy.Repetition(8)), self.acc_dtype
-            )
-            tCtQState_for_t2r = tCtQState[(None, None), 0, 0, 0]
-            tCtQState_for_r2t = tCtQState[(None, None), 0, 0, 0]
+        # Both fp32; Ld16x256b(Rep 8) and St16x256b(Rep 8) produce the same
+        # register layout at M=64 and M=128, so no M-dependent branch is needed.
+        atom_qs_t2r = cute.make_copy_atom(
+            tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)), self.acc_dtype
+        )
+        atom_qs_r2t = cute.make_copy_atom(
+            tcgen05.copy.St16x256bOp(tcgen05.copy.Repetition(8)), self.acc_dtype
+        )
+        tCtQState_for_t2r = tCtQState_mn_view[None, None, 0]
+        tCtQState_for_r2t = tCtQState_mn_view[None, None, 0]
         tiled_qs_t2r = tcgen05.make_tmem_copy(atom_qs_t2r, tCtQState_for_t2r)
         tiled_qs_r2t = tcgen05.make_tmem_copy(atom_qs_r2t, tCtQState_for_r2t)
         thr_qs_t2r = tiled_qs_t2r.get_slice(cg1_tidx)
@@ -4468,15 +4021,9 @@ class GatedDeltaNetChunkedKernel:
         )
         thr_v_s2r = tiled_v_s2r.get_slice(cg1_tidx)
 
-        if cutlass.const_expr(self.mma_tiler_qs[0] == 64):
-            atom_o_t2r = cute.make_copy_atom(
-                tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(16)),
-                self.acc_dtype,
-            )
-        else:
-            atom_o_t2r = cute.make_copy_atom(
-                tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)), self.acc_dtype
-            )
+        atom_o_t2r = cute.make_copy_atom(
+            tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)), self.acc_dtype
+        )
         tiled_o_t2r = tcgen05.make_tmem_copy(atom_o_t2r, tCtQState_for_t2r)
         thr_o_t2r = tiled_o_t2r.get_slice(cg1_tidx)
         tTR_tOtO = thr_o_t2r.partition_S(tCtQState_mn_view)
@@ -4560,7 +4107,7 @@ class GatedDeltaNetChunkedKernel:
                                     self.mma_tiler_kv[1],
                                 ),
                             )[None, None, 0, 0]
-                            tSgCheckpoints = thr_state_t2r.partition_D(gS_checkpoints)
+                            tSgCheckpoints = thr_state_r2g.partition_D(gS_checkpoints)
                             if cutlass.const_expr(self.state_dtype != self.acc_dtype):
                                 tRG_rState[None, 0, None].store(
                                     tTR_rState[None, 0, None]
