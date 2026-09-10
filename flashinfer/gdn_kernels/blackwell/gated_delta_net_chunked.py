@@ -2508,6 +2508,10 @@ class GatedDeltaNetChunkedKernel:
         )
         cS = cute.make_identity_tensor((self.mma_tiler_qk[0], self.mma_tiler_qk[1]))
         tStS_for_t2r = tStS_staged[(None, None), 0, 0, 0]
+        # 16x32bx2 is safe here, unlike in CG1: every consumer of this copy
+        # (tiled_ainv_r2s / tiled_qk_r2s / tiled_ainv_s2r) is
+        # make_tiled_copy_D-derived from it, so none of them can disagree with
+        # it.  See the copy-atom note in compute_group_1_chunk.
         atom_shared_t2r = cute.make_copy_atom(
             tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(16)), self.acc_dtype
         )
@@ -3501,6 +3505,8 @@ class GatedDeltaNetChunkedKernel:
         tCtState_mn_view = utils.gemm.sm100.transform_partitioned_tensor_layout(
             tCtState
         )
+        # registers -> TMEM.  At M=64 this must stay in the 16x256b family;
+        # see the copy-atom note in compute_group_1_chunk.
         if cutlass.const_expr(self.mma_tiler_kv[0] == 64):
             state_r2t_atom = cute.make_copy_atom(
                 tcgen05.copy.St16x256bOp(tcgen05.copy.Repetition(8)),
@@ -3612,18 +3618,6 @@ class GatedDeltaNetChunkedKernel:
         num_threads_cg1 = self.threads_per_warp * len(self.compute_group_1_warp_ids)
         cg1_tidx = tidx % num_threads_cg1
 
-        # M=64 fp32 TMEM atoms are the 16x256b family.  CUTLASS's selector
-        # (sm100_get_tmem_load_op) also offers 16dp128b for an N-major
-        # destination, but that is the 'stmatrix_n' variant: at M=64 its
-        # register fragment has a size-2 stride-0 (broadcast) mode because 16
-        # datapaths are shared by 32 threads, so it requires shfl/predication
-        # rather than a plain vectorized copy.  16dp32b is listed only as a
-        # commented-out
-        # alternative; no other kernel in flashinfer, cuDNN, the CuTe-DSL
-        # helpers or the CUTLASS examples passes 16x32bx2 to make_tmem_copy.
-        # Loads and stores must stay in the same family with matching
-        # Repetition (cf. blackwell/blockwise_gemm), which is why no
-        # hand-derived repetition halving is needed here.
         # Build state TMEM layout (mirrors compute_group_1 setup)
         state_acc_shape = tiled_mma_kv.partition_shape_C(
             (self.mma_tiler_kv[0], self.mma_tiler_kv[1])
@@ -3641,7 +3635,8 @@ class GatedDeltaNetChunkedKernel:
             (self.mma_tiler_kv[0], self.mma_tiler_kv[1])
         )
 
-        # TMEM -> registers. D=64 exposes a split (16, 2) value mode.
+        # TMEM -> registers.  At M=64 this must stay in the 16x256b family;
+        # see the copy-atom note in compute_group_1_chunk.
         if cutlass.const_expr(self.mma_tiler_kv[0] == 64):
             atom_state_t2r = cute.make_copy_atom(
                 tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)),
@@ -3800,6 +3795,8 @@ class GatedDeltaNetChunkedKernel:
         tCcState = cute.make_identity_tensor(
             (self.mma_tiler_kv[0], self.mma_tiler_kv[1])
         )
+        # TMEM <-> registers.  At M=64 both must stay in the 16x256b family;
+        # see the copy-atom note in compute_group_1_chunk.
         if cutlass.const_expr(self.mma_tiler_kv[0] == 64):
             atom_state_t2r = cute.make_copy_atom(
                 tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)),
@@ -3857,17 +3854,10 @@ class GatedDeltaNetChunkedKernel:
             (self.mma_tiler_qs[0], self.mma_tiler_qs[2])
         )
         if cutlass.const_expr(self.mma_tiler_qs[0] == 64):
-            # This store's register-side value layout must EQUAL the layout of
-            # the state accumulator read (atom_state_t2r), because the staged
-            # fragment tRT_rState_inp is filled from tTR_rState by a whole-
-            # tensor .store(.load()), which pairs the two by element index.
-            # Equal element counts are not sufficient: St16x256b(Rep 4) also
-            # carries 32 elements/thread at M=64, but lays them out
-            # (4,2,4):(1@1,8@0,16@1) while the paired Ld16x256b(Rep 8) fp32
-            # read gives (2,2,8):(1@1,8@0,8@1).  Element i then carries
-            # accumulator row 8*((i//2)%2) but is stored at row 8*((i//4)%2),
-            # so half of each thread's rows land on the wrong M row.
-            # St16x128b(Rep 8) reproduces the read's layout exactly.
+            # Paired with atom_state_t2r's Ld16x256b(Rep 8): tRT_rState_inp is
+            # filled from tTR_rState by a whole-tensor .store(.load()), which
+            # pairs them by element index, so the value layouts must be equal.
+            # See the copy-atom note in compute_group_1_chunk.
             atom_state_inp_r2t = cute.make_copy_atom(
                 tcgen05.copy.St16x128bOp(tcgen05.copy.Repetition(8)),
                 self.io_dtype,
@@ -3903,8 +3893,36 @@ class GatedDeltaNetChunkedKernel:
         tCcShared = cute.make_identity_tensor(
             (self.mma_tiler_qkv[0], self.mma_tiler_qkv[1])
         )
-        # Ld16x256b(Rep 8) is layout-correct at M=64 and M=128 alike (it is what
-        # atom_shared_inp_r2t's St16x128b(Rep 8) is matched against), so this
+        # ---- CG1 TMEM copy-atom choice (governs every atom in this method) --
+        # At M=64 the accumulator is split-lane ((16,4): logical row a+16b ->
+        # lane a+32b), so a warp owns 16 lanes and the 32-datapath atoms cannot
+        # be tiled at all -- make_tmem_copy rejects them.  Among the 16-datapath
+        # atoms the choice is still NOT free, because CG1 passes register
+        # fragments between independently constructed copies (the NV read feeds
+        # atom_shared_inp_r2t; tTR_rKS is combined elementwise with tRT_rV).
+        # Such atoms must agree on the register VALUE LAYOUT -- matching family,
+        # Repetition or element count is neither sufficient nor necessary:
+        #
+        #   Ld16x256b(Rep 8) f32   (2,2,8):(1@1,8@0,8@1)    2 rows/thread
+        #   St16x128b(Rep 8) bf16  (2,2,8):(1@1,8@0,8@1)    <- matches (paired)
+        #   St16x256b(Rep 4) bf16  (4,2,4):(1@1,8@0,16@1)   same 32 elements,
+        #                          but element i carries row 8*((i//2)%2) and is
+        #                          stored at row 8*((i//4)%2): silently wrong
+        #   Ld/St16x32bx2          ((32,1),1,1):((1@1,0),0,0)  1 row/thread
+        #
+        # So 16x32bx2 is NOT an interchangeable alternative here, even with
+        # Repetitions picked so its own read/write pair is self-consistent:
+        # tiled_v_s2r and tiled_o_r2s are DERIVED from these copies (ldmatrix /
+        # stmatrix, num_matrices=4) and assume the 2-rows-per-thread shape.
+        # Substituting the 16x32bx2 family was measured to scramble output rows
+        # at DV=64.  (CG0 uses 16x32bx2 safely only because every consumer there
+        # is make_tiled_copy_D-derived from it, so it cannot disagree.)
+        #
+        # To check a pair without a GPU, compare the register-side TV layouts:
+        #   cute.make_copy_atom(op, dt).layout_dst_tv   # registers, for a load
+        #   cute.make_copy_atom(op, dt).layout_src_tv   # registers, for a store
+        # ---------------------------------------------------------------------
+        # Ld16x256b(Rep 8) is layout-correct at M=64 and M=128 alike, so this
         # needs no M-dependent branch.  The mn_view slice and the raw
         # tCtShared[(None, None), 0, 0, 0] slice yield identical tiled copies;
         # the mn_view form is kept because it names the (M, N) axes explicitly.
@@ -3945,17 +3963,9 @@ class GatedDeltaNetChunkedKernel:
         tCcShared_inp = cute.make_identity_tensor(
             (self.mma_tiler_qkv[0], self.mma_tiler_qkv[2])
         )
-        # The register-side value layout of this store must EQUAL the layout of
-        # the NV/decay_v accumulator read (atom_shared_t2r), because the staged
-        # fragment tTR_rNv_inp is shaped from that read via
-        # make_rmem_tensor_like, so the two are paired by element index.
-        # Equal element counts are not sufficient: at M=64 St16x256b(Rep 4)
-        # also carries 32 elements/thread but lays them out
-        # (4,2,4):(1@1,8@0,16@1) while the paired Ld16x256b(Rep 8) fp32 read
-        # gives (2,2,8):(1@1,8@0,8@1) -- element i carries accumulator row
-        # 8*((i//2)%2) yet is stored at row 8*((i//4)%2), so half of every
-        # thread's rows land on the wrong M row.  St16x128b(Rep 8) reproduces
-        # the read's layout at M=64 and M=128 alike, so no branch is needed.
+        # Paired with atom_shared_t2r's Ld16x256b(Rep 8): tTR_rNv_inp is shaped
+        # from that read, so the two value layouts must be equal.  See the
+        # copy-atom note above -- St16x256b(Rep 4) is the invalid alternative.
         atom_shared_inp_r2t = cute.make_copy_atom(
             tcgen05.copy.St16x128bOp(tcgen05.copy.Repetition(8)), self.io_dtype
         )
@@ -4021,6 +4031,9 @@ class GatedDeltaNetChunkedKernel:
         )
         thr_v_s2r = tiled_v_s2r.get_slice(cg1_tidx)
 
+        # Free choice here: tiled_o_r2s below is make_tiled_copy_D-derived from
+        # this copy, so the two cannot disagree.  Kept in the 16x256b family for
+        # consistency with the rest of CG1 (see the copy-atom note above).
         atom_o_t2r = cute.make_copy_atom(
             tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)), self.acc_dtype
         )
