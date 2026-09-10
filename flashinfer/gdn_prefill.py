@@ -137,6 +137,7 @@ def chunk_gated_delta_rule(
     use_cp: Literal["auto"] | bool = "auto",
     state_indices: Optional[torch.Tensor] = None,
     _cp_chunk_len: Optional[int] = None,
+    num_householder: int = 1,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated Delta Rule (GDN) attention for prefill.
 
@@ -299,6 +300,8 @@ def chunk_gated_delta_rule(
 
     num_seqs = cu_seqlens.size(0) - 1
     total_seq_len = q.size(0)
+    if num_householder < 1:
+        raise ValueError(f"num_householder must be >= 1, got {num_householder}")
     num_q_heads = q.size(1)
     num_v_heads = v.size(1)
     head_size = q.size(2)
@@ -370,6 +373,13 @@ def chunk_gated_delta_rule(
     _cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
     _device_capability = get_compute_capability(device)
     _arch_major = _device_capability[0]
+    if num_householder > 1 and _arch_major != 10:
+        # Only the SM100 chunked kernel indexes q/gate/output per REAL
+        # token; elsewhere the caller must still expand the sequence.
+        raise NotImplementedError(
+            f"num_householder={num_householder} (Gated DeltaProduct) is only "
+            f"implemented on SM100, got compute capability {_arch_major}.x"
+        )
     _device_name = get_device_name(device)
     cp_heuristic_matches = _arch_major in (9, 10, 12) and should_use_cp_host(
         num_seqs * num_sab_heads,
@@ -546,6 +556,7 @@ def chunk_gated_delta_rule(
             cu_checkpoints=checkpoint_cu_starts,
             output_checkpoints=state_checkpoints,
             state_indices=state_indices,
+            num_householder=num_householder,
         )
     elif _arch_major == 12:
         # SM120 Blackwell path (CuTe DSL kernel)

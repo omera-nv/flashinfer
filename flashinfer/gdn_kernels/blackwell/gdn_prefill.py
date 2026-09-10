@@ -55,6 +55,7 @@ def _get_compiled_cache(
     HV: int,
     head_size: int,
     head_size_v: int,
+    num_householder: int,
     is_GQA: bool,
     use_initial_state: bool,
     store_final_state: bool,
@@ -151,6 +152,7 @@ def chunk_gated_delta_rule_sm100(
     cu_checkpoints: Optional[torch.Tensor] = None,
     output_checkpoints: Optional[torch.Tensor] = None,
     state_indices: Optional[torch.Tensor] = None,
+    num_householder: int = 1,
 ) -> None:
     """Execute the Blackwell chunked GDN prefill kernel.
 
@@ -170,6 +172,11 @@ def chunk_gated_delta_rule_sm100(
         checkpoint_every_n_tokens: store intermediate state every N tokens (0 = disabled)
         cu_checkpoints: ``(num_seqs + 1,)`` int32, cumulative checkpoint counts
         output_checkpoints: ``(total_checkpoints, HO, DV, DK)`` float32/bfloat16/float16/fp8, or None
+        num_householder: Gated DeltaProduct micro-steps per real token (1 = plain
+            GDN).  ``k``/``v``/``beta`` carry ``total_tokens * num_householder``
+            rows -- the householder axis sits next to the token axis, so that is
+            a free reshape -- while ``q``/``gate``/``output`` carry one row per
+            REAL token and the kernel indexes them directly.
     """
     HQ = q.size(1)
     HV = v.size(1)
@@ -203,6 +210,7 @@ def chunk_gated_delta_rule_sm100(
         HV,
         DK,
         DV,
+        num_householder,
         is_GQA,
         use_initial_state,
         store_final_state,
@@ -243,6 +251,7 @@ def chunk_gated_delta_rule_sm100(
             mma_tiler_qs=(DV, 64, DK),
             mma_tiler_qkv=(DV, 64, 64),
             mma_tiler_kv=(DV, DK, 64),
+            num_householder=num_householder,
             max_active_clusters=max_active_clusters,
             num_sm=num_sm,
             is_GQA=is_GQA,
