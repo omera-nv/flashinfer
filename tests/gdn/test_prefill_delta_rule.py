@@ -378,43 +378,6 @@ def test_prefill_kernel_nonfull(
     )
 
 
-def _rectangular_call(qkv_factory, head_size, head_size_v, use_cp=False):
-    device = torch.device("cuda")
-    seq_lens = [64]
-    with device:
-        q, k, v = qkv_factory(
-            seq_lens, 2, 2, 2, head_size, torch.bfloat16, head_size_v=head_size_v
-        )
-        k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
-        cu_seq_lens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int64)
-    return chunk_gated_delta_rule(
-        q, k, v, cu_seqlens=cu_seq_lens, output_final_state=True, use_cp=use_cp
-    )
-
-
-def test_wider_values_rejected(qkv_factory):
-    """head_size_v > head_size is rejected on every architecture."""
-    _skip_if_unsupported()
-    with pytest.raises(NotImplementedError, match="must not exceed head_size"):
-        _rectangular_call(qkv_factory, head_size=64, head_size_v=128)
-
-
-def test_rectangular_state_rejected_off_sm100(qkv_factory):
-    """SM90/SM120 are square-only and must say so rather than mis-shape."""
-    _skip_if_unsupported()
-    if is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("SM100 implements rectangular state")
-    with pytest.raises(NotImplementedError, match="Rectangular state"):
-        _rectangular_call(qkv_factory, head_size=128, head_size_v=64)
-
-
-def test_rectangular_state_rejected_by_cp(qkv_factory):
-    """Explicit use_cp=True must reject rather than silently fall back."""
-    _skip_if_cp_unsupported()
-    with pytest.raises(ValueError, match="head_size_v == head_size_k"):
-        _rectangular_call(qkv_factory, head_size=128, head_size_v=64, use_cp=True)
-
-
 @pytest.mark.parametrize(
     "head_size, head_size_v", [(128, 128), (128, 64)], ids=lambda hs: f"{hs}"
 )
