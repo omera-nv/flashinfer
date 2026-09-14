@@ -42,7 +42,6 @@ from .varlen_helper import (
 )
 from .delta_rule_sm90 import (
     _FullyFusedDeltaRuleSm90,
-    WarpGroupRole,
     LoadStoreWarpRole,
 )
 from .schedule import WorkDesc
@@ -3545,6 +3544,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
             first_B,
             tKVrKV,
             scale,
+            math_tidx,
             wg_idx,
         )
         self.maybe_store_checkpoint(
@@ -3601,6 +3601,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
                 self.BLK_KV,
                 tKVrKV,
                 scale,
+                math_tidx,
                 wg_idx,
             )
             self.maybe_store_checkpoint(
@@ -3660,6 +3661,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
                 last_B,
                 tKVrKV,
                 scale,
+                math_tidx,
                 wg_idx,
             )
             self.maybe_store_checkpoint(
@@ -3870,8 +3872,8 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
             checkpoint_every_n_tokens,
         ).launch(
             grid=(num_sab_heads * max_cp_chunks_per_seq, num_seqs, 1),
-            block=(512, 1, 1),
-            max_number_threads=(512, 1, 1),
+            block=(128 * self.warp_group_roles.num_warp_groups, 1, 1),
+            max_number_threads=(128 * self.warp_group_roles.num_warp_groups, 1, 1),
             stream=stream,
             min_blocks_per_mp=1,
         )
@@ -3910,7 +3912,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
         checkpoint_every_n_tokens: cutlass.Int32,
     ):
         NUM_LOAD_WARP_GROUPS = 1
-        NUM_STATE_MMA_WARP_GROUPS = 2
+        NUM_STATE_MMA_WARP_GROUPS = self.warp_group_roles.num_state_warp_groups
         NUM_AUX_MMA_WARP_GROUPS = 1
         THREADS_PER_WARP_GROUP = 128
         WARPS_PER_WARP_GROUP = 4
@@ -4145,7 +4147,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
         cute.arch.sync_threads()
 
         if is_valid_chunk:
-            if warp_group_idx == WarpGroupRole.LDST:
+            if warp_group_idx == self.warp_group_roles.LDST:
                 cute.arch.setmaxregister_decrease(load_registers)
                 if ldst_warp_role == LoadStoreWarpRole.LOAD_QKV:
                     self.run_load_qkv_role(
@@ -4204,7 +4206,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
                         num_sab_heads,
                     )
             else:
-                if warp_group_idx == WarpGroupRole.MATH_AUX:
+                if warp_group_idx == self.warp_group_roles.MATH_AUX:
                     cute.arch.setmaxregister_decrease(aux_mma_registers)
                     self.run_aux_math_role(
                         sQ_SD,

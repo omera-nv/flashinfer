@@ -25,13 +25,6 @@ class NamedBarrier(IntEnum):
     KK_SYNC = 13  # sync all 128 WG0 threads before collective_inverse
 
 
-class WarpGroupRole(IntEnum):
-    LDST = 0
-    MATH_STATE0 = 1
-    MATH_STATE1 = 2
-    MATH_AUX = 3
-
-
 class LoadStoreWarpRole(IntEnum):
     STORE_O = 0
     LOAD_QKV = 1
@@ -47,9 +40,20 @@ class MathWarpGroupRole(IntEnum):
     QK = 1
 
 
+class WarpGroupRoles:
+    def __init__(self, DV: int) -> None:
+        self.LDST = 0
+        self.num_state_warp_groups = 2 if DV == 128 else 1
+        self.MATH_AUX = self.num_state_warp_groups + 1
+
+    @property
+    def num_warp_groups(self) -> int:
+        return self.num_state_warp_groups + 2
+
+
 # ─── Warp-specialized delta-rule kernel ───────────────────────────────────────
 # Grid: (num_seqs * num_sab_heads, 1, 1)
-# Block: 512 threads → WG0=LD/ST, WG1/WG2=state math, WG3=aux math.
+# Block: 384 (DV=64) / 512 (DV=128) threads → WG0=LD/ST, WG1/WG2 (DV=128) =state math, WG3=aux math.
 #
 # needs_alpha / needs_beta / needs_init_state are class attributes set in __init__.
 # The JIT compiler specialises per instance, so they are compile-time booleans
@@ -198,6 +202,8 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
             "alpha_beta_stage",
         )
 
+        self.warp_group_roles = WarpGroupRoles(DV=self.DV)
+
     def get_next_work(
         self,
         cu_seqlens: cute.Tensor,
@@ -229,29 +235,47 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
     @cute.jit
     def _math_order_init(self, wg_idx: cutlass.Int32):
         """Pre-arrive at WG0's barrier so WG0 is unblocked on the first wait."""
+        if cutlass.const_expr(self.warp_group_roles.num_state_warp_groups == 1):
+            return
+
         if wg_idx == MathWarpGroupRole.QK:
             cute.arch.barrier_arrive(
-                barrier_id=NamedBarrier.MATH_WG0, number_of_threads=256
+                barrier_id=NamedBarrier.MATH_WG0,
+                number_of_threads=128 * self.warp_group_roles.num_state_warp_groups,
             )
 
     @cute.jit
     def _math_order_wait(self, wg_idx: cutlass.Int32):
         """Arrive+wait on this WG's own ordered barrier."""
+        if cutlass.const_expr(self.warp_group_roles.num_state_warp_groups == 1):
+            return
+
         if wg_idx == MathWarpGroupRole.KK:
-            cute.arch.barrier(barrier_id=NamedBarrier.MATH_WG0, number_of_threads=256)
+            cute.arch.barrier(
+                barrier_id=NamedBarrier.MATH_WG0,
+                number_of_threads=128 * self.warp_group_roles.num_state_warp_groups,
+            )
         else:
-            cute.arch.barrier(barrier_id=NamedBarrier.MATH_WG1, number_of_threads=256)
+            cute.arch.barrier(
+                barrier_id=NamedBarrier.MATH_WG1,
+                number_of_threads=128 * self.warp_group_roles.num_state_warp_groups,
+            )
 
     @cute.jit
     def _math_order_notify(self, wg_idx: cutlass.Int32):
         """Arrive at the other WG's barrier to unblock it."""
+        if cutlass.const_expr(self.warp_group_roles.num_state_warp_groups == 1):
+            return
+
         if wg_idx == MathWarpGroupRole.KK:
             cute.arch.barrier_arrive(
-                barrier_id=NamedBarrier.MATH_WG1, number_of_threads=256
+                barrier_id=NamedBarrier.MATH_WG1,
+                number_of_threads=128 * self.warp_group_roles.num_state_warp_groups,
             )
         else:
             cute.arch.barrier_arrive(
-                barrier_id=NamedBarrier.MATH_WG0, number_of_threads=256
+                barrier_id=NamedBarrier.MATH_WG0,
+                number_of_threads=128 * self.warp_group_roles.num_state_warp_groups,
             )
 
     # ─── kk_store_and_inv ─────────────────────────────────────────────────────
@@ -714,6 +738,11 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                 gCheckpointKV = mCheckpoint[None, None, o_head_idx, checkpoint_idx]
                 self.kv_store(tKVrKV, gCheckpointKV, kv_tiled_mma, thread_idx)
 
+    @property
+    def state_mma_atom_layout(self) -> tuple[int, int, int]:
+        # wgmma layout for when M=DV
+        return (self.warp_group_roles.num_state_warp_groups, 1, 1)
+
     # ─── compute_loop_body ───────────────────────────────────────────────────
     # Translates the C++ compute_loop_body lambda captured inside compute().
     # Called by Math WGs (tidx >= 128) for one block iteration.
@@ -757,10 +786,9 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         # Scale factor
         scale: cutlass.Float32,
         # WG role: MathWarpGroupRole.STATE0 or MathWarpGroupRole.STATE1.
+        math_tidx: cutlass.Int32,
         wg_idx: cutlass.Int32,
     ):
-        tidx, _, _ = cute.arch.thread_idx()
-        thread_idx = tidx - cutlass.Int32(128)  # relative to compute threads
         # ── TiledMMAs ─────────────────────────────────────────────────────────
         blk_q = cute.size(sQ_SD, mode=[0])
         blk_kv = cute.size(sK_SD, mode=[0])
@@ -807,18 +835,28 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
             )
         )
 
-        # O1/O2/SK/NewV: two state warpgroups cooperate as in the C++ Hopper GMMA path.
-        o1_tiled_mma = cute.make_tiled_mma(mma_atom_o1, cute.make_layout((2, 1, 1)))
-        o2_tiled_mma = cute.make_tiled_mma(mma_atom_o2, cute.make_layout((2, 1, 1)))
-        sk_tiled_mma = cute.make_tiled_mma(mma_atom_sk, cute.make_layout((2, 1, 1)))
-        newv_tiled_mma = cute.make_tiled_mma(mma_atom_newv, cute.make_layout((2, 1, 1)))
+        # O1/O2/SK/NewV:
+        # if DV=64 - single warp group.
+        # if DV=128 - two state warpgroups cooperate as in the C++ Hopper GMMA path.
+        o1_tiled_mma = cute.make_tiled_mma(
+            mma_atom_o1, cute.make_layout(self.state_mma_atom_layout)
+        )
+        o2_tiled_mma = cute.make_tiled_mma(
+            mma_atom_o2, cute.make_layout(self.state_mma_atom_layout)
+        )
+        sk_tiled_mma = cute.make_tiled_mma(
+            mma_atom_sk, cute.make_layout(self.state_mma_atom_layout)
+        )
+        newv_tiled_mma = cute.make_tiled_mma(
+            mma_atom_newv, cute.make_layout(self.state_mma_atom_layout)
+        )
 
         # ── Thread slices ─────────────────────────────────────────────────────
-        sk_thr_mma = sk_tiled_mma.get_slice(thread_idx)
-        newv_thr_mma = newv_tiled_mma.get_slice(thread_idx)
-        o1_thr_mma = o1_tiled_mma.get_slice(thread_idx)
-        o2_thr_mma = o2_tiled_mma.get_slice(thread_idx)
-        kv_thr_mma = kv_tiled_mma.get_slice(thread_idx)
+        sk_thr_mma = sk_tiled_mma.get_slice(math_tidx)
+        newv_thr_mma = newv_tiled_mma.get_slice(math_tidx)
+        o1_thr_mma = o1_tiled_mma.get_slice(math_tidx)
+        o2_thr_mma = o2_tiled_mma.get_slice(math_tidx)
+        kv_thr_mma = kv_tiled_mma.get_slice(math_tidx)
 
         # ── Copy atoms ────────────────────────────────────────────────────────
         ldsm_t4 = cute.make_copy_atom(
@@ -828,7 +866,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         # ── SK copies ─────────────────────────────────────────────────────────
         # SK C: V loaded from sV_DS (col-major D×BlkKV) with LDSM_T.
         sk_tiled_copy_C = cute.make_tiled_copy_C(ldsm_t4, sk_tiled_mma)
-        sk_thr_copy_C = sk_tiled_copy_C.get_slice(thread_idx)
+        sk_thr_copy_C = sk_tiled_copy_C.get_slice(math_tidx)
         tSKsK = sk_thr_mma.partition_B(sK_SD)
         tSKrK = sk_thr_mma.make_fragment_B(tSKsK)
 
@@ -851,7 +889,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
             warp.StMatrix8x8x16bOp(transpose=True, num_matrices=4), self.dtype
         )
         o_tiled_copy_r2s = cute.make_tiled_copy_C(o_stsm, o1_tiled_mma)
-        o_thr_copy_r2s = o_tiled_copy_r2s.get_slice(thread_idx)
+        o_thr_copy_r2s = o_tiled_copy_r2s.get_slice(math_tidx)
         tOsO = o_thr_copy_r2s.partition_D(sO)
 
         # ── Coordinate tensors for masking / alpha/beta indexing ──────────────
@@ -1183,8 +1221,8 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         checkpoint_cu_starts: cute.Tensor,
         work_desc: WorkDesc,
         scale: cutlass.Float32,
-        wg_idx: cutlass.Int32,
         math_tidx: cutlass.Int32,
+        wg_idx: cutlass.Int32,
         num_blocks: cutlass.Int32,
         num_q_heads: cutlass.Int32,
         num_v_heads: cutlass.Int32,
@@ -1228,7 +1266,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                     cute.nvgpu.OperandMajorMode.MN,
                 )
             ),
-            cute.make_layout((2, 1, 1)),
+            cute.make_layout(self.state_mma_atom_layout),
         )
         kv_thr_mma = kv_tiled_mma.get_slice(math_tidx)
         tKVrKV = kv_thr_mma.make_fragment_C(
@@ -1308,6 +1346,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                 first_B,
                 tKVrKV,
                 scale,
+                math_tidx,
                 wg_idx,
             )
         else:
@@ -1349,6 +1388,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                 first_B,
                 tKVrKV,
                 scale,
+                math_tidx,
                 wg_idx,
             )
         self.maybe_store_checkpoint(
@@ -1407,6 +1447,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                 cutlass.Int32(self.BLK_KV),
                 tKVrKV,
                 scale,
+                math_tidx,
                 wg_idx,
             )
             self.maybe_store_checkpoint(
@@ -1465,6 +1506,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                 last_B,
                 tKVrKV,
                 scale,
+                math_tidx,
                 wg_idx,
             )
             self.maybe_store_checkpoint(
@@ -1638,11 +1680,9 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         beta_pipeline,
         work_desc: WorkDesc,
         scale: cutlass.Float32,
-        math_tidx: cutlass.Int32,
+        aux_tidx: cutlass.Int32,
         num_blocks: cutlass.Int32,
     ):
-        aux_tidx = math_tidx % cutlass.Int32(128)
-
         qk_tiled_mma = cute.make_tiled_mma(
             cute.make_mma_atom(
                 warpgroup.MmaF16BF16Op(
@@ -1976,8 +2016,8 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
             checkpoint_every_n_tokens,
         ).launch(
             grid=(grid_x, 1, 1),
-            block=(512, 1, 1),
-            max_number_threads=(512, 1, 1),
+            block=(128 * self.warp_group_roles.num_warp_groups, 1, 1),
+            max_number_threads=(128 * self.warp_group_roles.num_warp_groups, 1, 1),
             stream=stream,
             min_blocks_per_mp=1,
         )
@@ -2012,7 +2052,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         checkpoint_every_n_tokens: cutlass.Int32,
     ):
         NUM_LOAD_WARP_GROUPS = 1
-        NUM_STATE_MMA_WARP_GROUPS = 2
+        NUM_STATE_MMA_WARP_GROUPS = self.warp_group_roles.num_state_warp_groups
         NUM_AUX_MMA_WARP_GROUPS = 1
         THREADS_PER_WARP_GROUP = 128
         WARPS_PER_WARP_GROUP = 4
@@ -2030,6 +2070,8 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
             NUM_STATE_MMA_WARP_GROUPS,
             THREADS_PER_WARP_GROUP,
         )
+
+        FIRST_MATH_TID = NUM_LOAD_WARP_GROUPS * THREADS_PER_WARP_GROUP
 
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -2058,8 +2100,9 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         ) // cutlass.Int32(self.BLK_KV)
 
         # math_tidx / wg_idx: valid for Math WG threads; LdSt WG gets negative values (unused)
-        math_tidx = tidx - cutlass.Int32(THREADS_PER_WARP_GROUP)
+        math_tidx = tidx - cutlass.Int32(FIRST_MATH_TID)
         wg_idx = math_tidx // cutlass.Int32(THREADS_PER_WARP_GROUP)
+        aux_tidx = math_tidx % cutlass.Int32(THREADS_PER_WARP_GROUP)
 
         # ── Smem allocation ───────────────────────────────────────────────────
         allocator = cutlass.utils.SmemAllocator()
@@ -2228,7 +2271,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
 
         if (
             work_desc.seq_len != cutlass.Int32(0)
-            and warp_group_idx == WarpGroupRole.LDST
+            and warp_group_idx == self.warp_group_roles.LDST
         ):
             cute.arch.setmaxregister_decrease(load_registers)
             if ldst_warp_role == LoadStoreWarpRole.LOAD_QKV:
@@ -2289,7 +2332,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                     num_sab_heads,
                 )
         elif work_desc.seq_len != cutlass.Int32(0):
-            if warp_group_idx == WarpGroupRole.MATH_AUX:
+            if warp_group_idx == self.warp_group_roles.MATH_AUX:
                 cute.arch.setmaxregister_decrease(aux_mma_registers)
                 self.run_aux_math_role(
                     sQ_SD,
@@ -2307,7 +2350,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                     beta_pipeline,
                     work_desc,
                     scale,
-                    math_tidx,
+                    aux_tidx,
                     num_blocks,
                 )
             else:
@@ -2336,8 +2379,8 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                     checkpoint_cu_starts,
                     work_desc,
                     scale,
-                    wg_idx,
                     math_tidx,
+                    wg_idx,
                     num_blocks,
                     num_q_heads,
                     num_v_heads,
@@ -2385,6 +2428,8 @@ def delta_rule_prefill_dsl_sm90(
         raise RuntimeError("can_implement failed")
     if DK not in (64, 128):
         raise RuntimeError(f"DSL kernel only supports DK=64/128, got {DK}")
+    if DV not in (64, 128):
+        raise RuntimeError(f"DSL kernel only supports DV=64/128, got {DV}")
 
     needs_alpha = alpha is not None
     needs_beta = beta is not None
