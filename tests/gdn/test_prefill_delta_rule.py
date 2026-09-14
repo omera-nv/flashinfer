@@ -288,8 +288,12 @@ def test_prefill_kernel_basic(
     seed: int = int(os.environ.get("SEED", "0")),
 ):
     if head_size != head_size_v:
-        # only implemented for sm100
-        _skip_if_not_sm100()
+        device = torch.device("cuda")
+        cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
+        if not is_sm90a_supported(device) and not (
+            is_sm100a_supported(device) and cuda_major >= 13
+        ):
+            pytest.skip("DV != DK requires SM100 or SM90")
 
     scale = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
     _test_prefill_kernel(
