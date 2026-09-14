@@ -373,12 +373,12 @@ def chunk_gated_delta_rule(
     _cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
     _device_capability = get_compute_capability(device)
     _arch_major = _device_capability[0]
-    if num_householder > 1 and _arch_major != 10:
+    if num_householder > 1 and _arch_major not in (9, 10):
         # Only the SM100 chunked kernel indexes q/gate/output per REAL
         # token; elsewhere the caller must still expand the sequence.
         raise NotImplementedError(
             f"num_householder={num_householder} (Gated DeltaProduct) is only "
-            f"implemented on SM100, got compute capability {_arch_major}.x"
+            f"implemented on SM90 and SM100, got compute capability {_arch_major}.x"
         )
     _device_name = get_device_name(device)
     cp_heuristic_matches = _arch_major in (9, 10, 12) and should_use_cp_host(
@@ -565,7 +565,7 @@ def chunk_gated_delta_rule(
         if head_size_v != head_size:
             raise NotImplementedError(
                 "Rectangular state (head_size_v != head_size) is only implemented "
-                f"on the SM100 GDN prefill kernel; got head_size_v={head_size_v}, "
+                f"on the SM100 and SM90 GDN prefill kernels; got head_size_v={head_size_v}, "
                 f"head_size={head_size} on compute-capability major {_arch_major}."
             )
         if output_state is None:
