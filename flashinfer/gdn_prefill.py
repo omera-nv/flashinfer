@@ -597,12 +597,6 @@ def chunk_gated_delta_rule(
         # SM90 Hopper path (CuTe DSL kernel)
         if chunk_gated_delta_rule_sm90 is None:
             raise NotImplementedError("SM90 GDN prefill DSL kernel is unavailable")
-        if head_size_v != head_size:
-            raise NotImplementedError(
-                "Rectangular state (head_size_v != head_size) is only implemented "
-                f"on the SM100 GDN prefill kernel; got head_size_v={head_size_v}, "
-                f"head_size={head_size} on compute-capability major {_arch_major}."
-            )
 
         if output_state is None:
             output_state = torch.empty(

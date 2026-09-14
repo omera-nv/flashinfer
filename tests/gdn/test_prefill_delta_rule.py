@@ -253,7 +253,7 @@ def test_prefill_block_end_decay(qkv_factory, seed=0):
 @pytest.mark.parametrize("alpha", [False, True])
 @pytest.mark.parametrize("scale", [1.0, "auto"])
 @pytest.mark.parametrize("use_cp", [False, True])
-@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize("head_size", [128, 64])
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
     [
@@ -294,6 +294,11 @@ def test_prefill_kernel_basic(
             is_sm100a_supported(device) and cuda_major >= 13
         ):
             pytest.skip("DV != DK requires SM100 or SM90")
+
+    if head_size_v > head_size:
+        pytest.skip("DV > DK is not supported")
+    if use_cp and (head_size, head_size_v) != (128, 128):
+        pytest.skip("CP path only supports square DK=DV=128")
 
     scale = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
     _test_prefill_kernel(
