@@ -252,8 +252,8 @@ def test_prefill_block_end_decay(qkv_factory, seed=0):
 @pytest.mark.parametrize("beta", [False, True])
 @pytest.mark.parametrize("alpha", [False, True])
 @pytest.mark.parametrize("scale", [1.0, "auto"])
-@pytest.mark.parametrize("use_cp", [False, True])
-@pytest.mark.parametrize("head_size", [128, 64])
+@pytest.mark.parametrize("use_cp", [False, True], ids=lambda cp: f"cp{int(cp)}")
+@pytest.mark.parametrize("head_size", [128, 64], ids=lambda head_size: f"dk{head_size}")
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
     [
@@ -270,7 +270,9 @@ def test_prefill_block_end_decay(qkv_factory, seed=0):
 @pytest.mark.parametrize("seq_lens", [[64], [128], [256], [256, 256], [64, 128, 512]])
 @pytest.mark.parametrize("block_size", [64])
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
-@pytest.mark.parametrize("head_size_v", [128, 64])
+@pytest.mark.parametrize(
+    "head_size_v", [128, 64], ids=lambda head_size: f"dv{head_size}"
+)
 def test_prefill_kernel_basic(
     qkv_factory,
     dtype: str,
