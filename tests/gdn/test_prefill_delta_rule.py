@@ -270,6 +270,7 @@ def test_prefill_block_end_decay(qkv_factory, seed=0):
 @pytest.mark.parametrize("seq_lens", [[64], [128], [256], [256, 256], [64, 128, 512]])
 @pytest.mark.parametrize("block_size", [64])
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("head_size_v", [128, 64])
 def test_prefill_kernel_basic(
     qkv_factory,
     dtype: str,
@@ -283,8 +284,13 @@ def test_prefill_kernel_basic(
     alpha: bool,
     beta: bool,
     use_cp: bool,
+    head_size_v: int,
     seed: int = int(os.environ.get("SEED", "0")),
 ):
+    if head_size != head_size_v:
+        # only implemented for sm100
+        _skip_if_not_sm100()
+
     scale = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
     _test_prefill_kernel(
         qkv_factory,
@@ -300,6 +306,7 @@ def test_prefill_kernel_basic(
         beta,
         use_cp,
         seed,
+        head_size_v,
     )
 
 
@@ -357,61 +364,6 @@ def test_prefill_kernel_nonfull(
         beta,
         use_cp,
         seed,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Rectangular state: head_size_v < head_size
-#
-# The recurrent state is [H, V, K] with V < K, so the value/output head dim is
-# narrower than the key/query one.  Only the SM100 chunked kernel implements
-# this; SM90/SM120/CP are square-only and must reject it.
-# ---------------------------------------------------------------------------
-
-_RECT_HEAD_SIZE = 128
-_RECT_HEAD_SIZE_V = 64
-
-
-@pytest.mark.parametrize("beta", [False, True])
-@pytest.mark.parametrize("alpha", [False, True])
-@pytest.mark.parametrize(
-    "num_q_heads, num_k_heads, num_v_heads",
-    [
-        (1, 1, 1),
-        (4, 1, 1),
-        (2, 2, 4),
-        (16, 16, 32),
-    ],
-)
-@pytest.mark.parametrize("seq_lens", [[64], [256], [31], [256, 256], [64, 128, 512]])
-@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
-def test_prefill_kernel_rectangular_state(
-    qkv_factory,
-    dtype: str,
-    num_q_heads: int,
-    num_k_heads: int,
-    num_v_heads: int,
-    seq_lens: list[int],
-    alpha: bool,
-    beta: bool,
-    seed: int = int(os.environ.get("SEED", "0")),
-):
-    _skip_if_not_sm100()
-    _test_prefill_kernel(
-        qkv_factory,
-        dtype,
-        num_q_heads,
-        num_k_heads,
-        num_v_heads,
-        _RECT_HEAD_SIZE,
-        64,
-        seq_lens,
-        1.0 / math.sqrt(_RECT_HEAD_SIZE),
-        alpha,
-        beta,
-        False,
-        seed,
-        head_size_v=_RECT_HEAD_SIZE_V,
     )
 
 
