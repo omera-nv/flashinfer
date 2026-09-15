@@ -600,7 +600,7 @@ def chunk_gated_delta_rule(
 
         if output_state is None:
             output_state = torch.empty(
-                (num_seqs, num_sab_heads, head_size, head_size),
+                (num_seqs, num_sab_heads, head_size_v, head_size),
                 dtype=torch.float32,
                 device=device,
             )
@@ -620,6 +620,7 @@ def chunk_gated_delta_rule(
             checkpoint_cu_starts,
             checkpoint_every_n_tokens,
             state_indices=state_indices,
+            num_householder=num_householder,
         )
     else:
         raise NotImplementedError("GDN prefill DSL kernel is unavailable")
