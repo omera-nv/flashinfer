@@ -292,10 +292,15 @@ def test_prefill_kernel_matches_reference(
     device = torch.device("cuda")
     dtype = getattr(torch, dtype)
 
-    if head_size == 64 and torch.cuda.get_device_capability(device)[0] != 10:
-        pytest.skip("head_size=64 GDP prefill is currently supported on SM100 only")
-    if head_size_v != head_size and torch.cuda.get_device_capability(device)[0] != 10:
-        pytest.skip("rectangular state is currently supported on SM100 only")
+    if head_size == 64 and torch.cuda.get_device_capability(device)[0] not in (9, 10):
+        pytest.skip(
+            "head_size=64 GDP prefill is currently supported on SM90/SM100 only"
+        )
+    if head_size_v != head_size and torch.cuda.get_device_capability(device)[0] not in (
+        9,
+        10,
+    ):
+        pytest.skip("rectangular state is currently supported on SM90/SM100 only")
 
     q, k, v, alpha, beta, cu_seqlens = _gen_product_inputs(
         seq_lens,
