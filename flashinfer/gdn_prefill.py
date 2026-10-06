@@ -808,17 +808,6 @@ def chunk_gated_delta_rule(
     ):
         raise RuntimeError("the source-only Cake GDN backend is not installed")
 
-    if use_qk_l2norm_in_kernel:
-        # Accepted for signature compatibility with FLA and with the decode
-        # entry point, but never implemented here: the parameter was read
-        # nowhere in this module. Silently ignoring it returns a plausible but
-        # wrong result, so fail instead.
-        raise NotImplementedError(
-            "chunk_gated_delta_rule does not normalize q/k in-kernel; apply the "
-            "L2 norm to q and k before calling. gated_delta_rule_mtp (decode) "
-            "does implement use_qk_l2norm."
-        )
-
     if use_cp not in ("auto", True, False):
         raise ValueError(f'use_cp must be "auto", True, or False, got {use_cp!r}')
     if checkpoint_every_n_tokens < 0:
