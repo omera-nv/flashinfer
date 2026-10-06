@@ -1175,7 +1175,8 @@ def chunk_gated_delta_rule(
                 return output, output_state
             return output
 
-    if num_householder > 1 and backend != "flashinfer":
+    # "auto" resolves to the flashinfer kernels below, which do implement GDP.
+    if num_householder > 1 and backend not in ("auto", "flashinfer"):
         raise ValueError(
             "num_householder > 1 is only implemented for the flashinfer GDN backend"
         )
