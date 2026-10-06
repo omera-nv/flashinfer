@@ -1176,7 +1176,9 @@ def chunk_gated_delta_rule(
             return output
 
     if num_householder > 1 and backend != "flashinfer":
-        raise ValueError("num_householder > 1 is only implemented for the flashinfer GDN backend")
+        raise ValueError(
+            "num_householder > 1 is only implemented for the flashinfer GDN backend"
+        )
 
     # Compiled Cake specializations cover more shapes than have been qualified
     # against the existing prefill kernels. Keep them opt-in until automatic

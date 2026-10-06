@@ -2817,6 +2817,8 @@ def _mtp_kernel_name(
     use_smem_v: bool = False,
     use_packed_fma: bool = True,
     per_token_pool_scatter: bool = False,
+    n_h: int = 1,
+    chunk_rows: int | None = None,
 ) -> str:
     """Specialization name within the gdn_decode_mtp module, encoding the
     kernel variant ("inline" or "warp") and every parameter that affects
@@ -2842,6 +2844,7 @@ def _mtp_kernel_name(
         use_smem_v,
         use_packed_fma,
         per_token_pool_scatter,
+        n_h,
     )
 
 
@@ -3039,8 +3042,8 @@ def run_mtp_decode(
             use_smem_v,
             use_packed_fma,
             per_token_pool_scatter,
-            chunk_rows,
             n_h,
+            chunk_rows,
         )
         cache = _get_compiled_mtp_kernel(*warp_cache_key)
 
