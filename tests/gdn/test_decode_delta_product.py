@@ -624,27 +624,24 @@ def test_negative_ssm_state_index_skips_write(batch_size, dispatch, num_househol
     )
 
 
-def test_decode_rejects_token_count_mismatch():
-    """k carries n_h rows per real token; q carries one. Enforce the ratio."""
-    from flashinfer.gdn_decode import gated_delta_rule_mtp
-
+def test_decode_rejects_mismatched_householder_counts():
+    """k, v and beta must agree on how many householders a token carries."""
     B, T, n_h, HQ, HV, K, V = 2, 2, 3, 16, 32, 128, 128
     device, dtype = torch.device("cuda"), torch.bfloat16
     q, k, v, A_log, a, dt_bias, b, pool, idx, _ = _gen_decode_inputs(
         B, T, n_h, HQ, HV, K, V, dtype, device, seed=29
     )
-    with pytest.raises(AssertionError, match="num_householder"):
-        gated_delta_rule_mtp(
-            q,
-            k.flatten(1, 2),
-            v.flatten(1, 2),
-            pool,
-            idx,
-            A_log,
-            a,
-            dt_bias,
-            b.flatten(1, 2),
+    with pytest.raises(ValueError, match="householder"):
+        gated_delta_product_mtp(
+            q=q,
+            k=k,
+            v=v[:, :, : n_h - 1],
+            initial_state=pool,
+            initial_state_indices=idx,
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            b=b,
             scale=K**-0.5,
             disable_state_update=False,
-            num_householder=n_h + 1,
         )
