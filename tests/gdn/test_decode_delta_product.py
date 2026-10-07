@@ -35,7 +35,7 @@ from flashinfer.utils import (
     is_sm100a_supported,
     is_sm12x_supported,
 )
-from flashinfer.gdn_product import GATE_NEUTRAL_A_SENTINEL, gated_delta_product_mtp
+from flashinfer.gdp_decode import GATE_NEUTRAL_A_SENTINEL, gated_delta_product_mtp
 
 from .reference_delta_product import delta_product
 
