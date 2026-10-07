@@ -130,14 +130,14 @@ def gated_delta_product_mtp(
     # expansion scratch at all.
     return gated_delta_rule_mtp(
         q,
-        k.flatten(1, 2),
-        v.flatten(1, 2),
+        k,
+        v,
         initial_state,
         initial_state_indices,
         A_log,
         a,
         dt_bias,
-        b.flatten(1, 2),
+        b,
         scale=scale,
         output=output,
         ssm_state_indices=ssm_state_indices,
