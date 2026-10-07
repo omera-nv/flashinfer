@@ -4173,7 +4173,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
                         v_head_idx,
                     )
                 elif ldst_warp_role == LoadStoreWarpRole.STORE_O:
-                    CollectiveStoreTma(self.BLK_Q, self.D, self.num_householder).run(
+                    CollectiveStoreTma(self.BLK_Q, self.D).run(
                         sO,
                         tma_atom_o,
                         tma_tensor_o,
