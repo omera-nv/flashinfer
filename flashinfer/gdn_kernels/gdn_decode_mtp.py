@@ -556,7 +556,7 @@ def gdn_verify_kernel_mtp(
             # Warp 0: Phase 1 — compute and broadcast q, k, g, beta via SMEM
             for i_t in cutlass.range_constexpr(T):
                 q_tile = cute.local_tile(
-                    q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_in_group)
+                    q, (1, 1, 1, vec_size), (i_n, i_t // n_h, i_h, lane_in_group)
                 )
                 k_tile = cute.local_tile(
                     k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_in_group)
@@ -565,7 +565,11 @@ def gdn_verify_kernel_mtp(
                 cute.autovec_copy(k_tile[(0, 0, 0, None)], r_k_bf16)
 
                 for i in cutlass.range_constexpr(vec_size):
-                    r_q[i] = cutlass.Float32(r_q_bf16[i])
+                    r_q[i] = cutlass.Float32(r_q_bf16[i]) * (
+                        cutlass.Float32(1.0)
+                        if cutlass.const_expr(i_t % n_h == n_h - 1)
+                        else cutlass.Float32(0.0)
+                    )
                     r_k[i] = cutlass.Float32(r_k_bf16[i])
 
                 if cutlass.const_expr(use_qk_l2norm):
@@ -2179,7 +2183,11 @@ def gdn_verify_kernel_mtp_inline(
                     cute.autovec_copy(q_tile[(0, 0, 0, None)], r_q_bf16)
                     cute.autovec_copy(k_tile[(0, 0, 0, None)], r_k_bf16)
                     for i in cutlass.range_constexpr(vec_size):
-                        r_q[i] = cutlass.Float32(r_q_bf16[i])
+                        r_q[i] = cutlass.Float32(r_q_bf16[i]) * (
+                            cutlass.Float32(1.0)
+                            if cutlass.const_expr(0 % n_h == n_h - 1)
+                            else cutlass.Float32(0.0)
+                        )
                         r_k[i] = cutlass.Float32(r_k_bf16[i])
                     if cutlass.const_expr(not use_qk_l2norm):
                         for i in cutlass.range_constexpr(vec_size):
@@ -2442,7 +2450,7 @@ def gdn_verify_kernel_mtp_inline(
                             q_tile = cute.local_tile(
                                 q,
                                 (1, 1, 1, vec_size),
-                                (i_n, i_t + 1, i_h, lane_in_group),
+                                (i_n, (i_t + 1) // n_h, i_h, lane_in_group),
                             )
                             k_tile = cute.local_tile(
                                 k,
@@ -2452,7 +2460,11 @@ def gdn_verify_kernel_mtp_inline(
                             cute.autovec_copy(q_tile[(0, 0, 0, None)], r_q_bf16)
                             cute.autovec_copy(k_tile[(0, 0, 0, None)], r_k_bf16)
                             for i in cutlass.range_constexpr(vec_size):
-                                r_q[i] = cutlass.Float32(r_q_bf16[i])
+                                r_q[i] = cutlass.Float32(r_q_bf16[i]) * (
+                                    cutlass.Float32(1.0)
+                                    if cutlass.const_expr((i_t + 1) % n_h == n_h - 1)
+                                    else cutlass.Float32(0.0)
+                                )
                                 r_k[i] = cutlass.Float32(r_k_bf16[i])
                             if cutlass.const_expr(not use_qk_l2norm):
                                 for i in cutlass.range_constexpr(vec_size):
@@ -2529,7 +2541,9 @@ def gdn_verify_kernel_mtp_inline(
                     # Batch load ALL q/k + compute ALL L2 norms
                     for i_t in cutlass.range_constexpr(T):
                         q_tile = cute.local_tile(
-                            q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_in_group)
+                            q,
+                            (1, 1, 1, vec_size),
+                            (i_n, i_t // n_h, i_h, lane_in_group),
                         )
                         k_tile = cute.local_tile(
                             k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_in_group)
