@@ -380,6 +380,10 @@ def gdn_verify_kernel_mtp(
     use_packed_fma: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
     cache_replayssm: cutlass.Constexpr[bool],
+    # Householders per real token.  q and a carry one row per REAL token and
+    # are synthesised for the other micro-steps; k/v/b carry all n_h.  n_h == 1
+    # is plain GDN and every predicate below folds away.
+    n_h: cutlass.Constexpr[int],
 ):
     """
     Parallel MTP kernel - each block handles one [TILE_V, TILE_K] tile.
@@ -596,7 +600,7 @@ def gdn_verify_kernel_mtp(
                     sQ[(i_t, k_start + i)] = r_q[i]
                     sK[(i_t, k_start + i)] = r_k[i]
 
-                r_a = cutlass.Float32(a[i_n, i_t, i_hv])
+                r_a = cutlass.Float32(a[i_n, i_t // n_h, i_hv])
                 r_b = cutlass.Float32(b[i_n, i_t, i_hv])
 
                 x = r_a + r_dt_bias
@@ -620,7 +624,11 @@ def gdn_verify_kernel_mtp(
                 r_beta = cutlass.Float32(1.0) / (
                     cutlass.Float32(1.0) + cute.exp(-r_b, fastmath=True)
                 )
-                r_g = cute.exp(r_g_value, fastmath=True)
+                r_g = (
+                    cute.exp(r_g_value, fastmath=True)
+                    if cutlass.const_expr(i_t % n_h == 0)
+                    else cutlass.Float32(1.0)
+                )
 
                 # All threads in warp 0 write same warp-uniform values
                 sG[i_t] = r_g
@@ -918,11 +926,17 @@ def gdn_verify_kernel_mtp(
                                 cute.autovec_copy(cute.slice_(r_h, (7, None)), it7)
 
                         # FLA-style per-token scatter: write h_{i_t+1} directly
-                        # to pool[ssm_state_indices[i_n, i_t]] (a different slot
+                        # to pool[ssm_state_indices[i_n, i_t // n_h]] (a different slot
                         # per iteration). h0_source is [pool_size * HV, V, K] so
                         # the slot-flat index is pool_slot * HV + i_hv.
-                        if cutlass.const_expr(per_token_pool_scatter):
-                            pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
+                        # The snapshot belongs to the real token, so only its
+                        # last micro-step scatters.
+                        if cutlass.const_expr(
+                            per_token_pool_scatter and i_t % n_h == n_h - 1
+                        ):
+                            pool_slot_t = cutlass.Int32(
+                                ssm_state_indices[i_n, i_t // n_h]
+                            )
                             if pool_slot_t >= 0:
                                 # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
                                 # (65,536 bytes). Element multiply overflows Int32 at
@@ -1038,14 +1052,32 @@ def gdn_verify_kernel_mtp(
                                 sOutput[(i_t, vl0 + 6)] = cutlass.BFloat16(o6)
                                 sOutput[(i_t, vl0 + 7)] = cutlass.BFloat16(o7)
                             else:
-                                o[(i_n, i_t, i_hv, v0)] = cutlass.BFloat16(o0)
-                                o[(i_n, i_t, i_hv, v1)] = cutlass.BFloat16(o1)
-                                o[(i_n, i_t, i_hv, v2)] = cutlass.BFloat16(o2)
-                                o[(i_n, i_t, i_hv, v3)] = cutlass.BFloat16(o3)
-                                o[(i_n, i_t, i_hv, v4)] = cutlass.BFloat16(o4)
-                                o[(i_n, i_t, i_hv, v5)] = cutlass.BFloat16(o5)
-                                o[(i_n, i_t, i_hv, v6)] = cutlass.BFloat16(o6)
-                                o[(i_n, i_t, i_hv, v7)] = cutlass.BFloat16(o7)
+                                # Only the last micro-step of a real token produces an output row.
+                                if cutlass.const_expr(i_t % n_h == n_h - 1):
+                                    o[(i_n, i_t // n_h, i_hv, v0)] = cutlass.BFloat16(
+                                        o0
+                                    )
+                                    o[(i_n, i_t // n_h, i_hv, v1)] = cutlass.BFloat16(
+                                        o1
+                                    )
+                                    o[(i_n, i_t // n_h, i_hv, v2)] = cutlass.BFloat16(
+                                        o2
+                                    )
+                                    o[(i_n, i_t // n_h, i_hv, v3)] = cutlass.BFloat16(
+                                        o3
+                                    )
+                                    o[(i_n, i_t // n_h, i_hv, v4)] = cutlass.BFloat16(
+                                        o4
+                                    )
+                                    o[(i_n, i_t // n_h, i_hv, v5)] = cutlass.BFloat16(
+                                        o5
+                                    )
+                                    o[(i_n, i_t // n_h, i_hv, v6)] = cutlass.BFloat16(
+                                        o6
+                                    )
+                                    o[(i_n, i_t // n_h, i_hv, v7)] = cutlass.BFloat16(
+                                        o7
+                                    )
 
                     # Write final state back for all 8 rows. Negative write
                     # indices (output_state_indices == -1) skip the writeback.
@@ -1446,18 +1478,20 @@ def gdn_verify_kernel_mtp(
                                 sOutput[(i_t, vla + 2)] = cutlass.BFloat16(sum_hq_c)
                                 sOutput[(i_t, vla + 3)] = cutlass.BFloat16(sum_hq_d)
                             else:
-                                o[(i_n, i_t, i_hv, v_idx_a)] = cutlass.BFloat16(
-                                    sum_hq_a
-                                )
-                                o[(i_n, i_t, i_hv, v_idx_b)] = cutlass.BFloat16(
-                                    sum_hq_b
-                                )
-                                o[(i_n, i_t, i_hv, v_idx_c)] = cutlass.BFloat16(
-                                    sum_hq_c
-                                )
-                                o[(i_n, i_t, i_hv, v_idx_d)] = cutlass.BFloat16(
-                                    sum_hq_d
-                                )
+                                # Only the last micro-step of a real token produces an output row.
+                                if cutlass.const_expr(i_t % n_h == n_h - 1):
+                                    o[(i_n, i_t // n_h, i_hv, v_idx_a)] = (
+                                        cutlass.BFloat16(sum_hq_a)
+                                    )
+                                    o[(i_n, i_t // n_h, i_hv, v_idx_b)] = (
+                                        cutlass.BFloat16(sum_hq_b)
+                                    )
+                                    o[(i_n, i_t // n_h, i_hv, v_idx_c)] = (
+                                        cutlass.BFloat16(sum_hq_c)
+                                    )
+                                    o[(i_n, i_t // n_h, i_hv, v_idx_d)] = (
+                                        cutlass.BFloat16(sum_hq_d)
+                                    )
 
                         # Cache intermediate state LAST in timestep (fire-and-forget stores
                         # overlap with next timestep's compute)
@@ -1489,8 +1523,14 @@ def gdn_verify_kernel_mtp(
                             cute.autovec_copy(cute.slice_(r_h, (3, None)), inter_tile_d)
 
                         # FLA-style per-token pool scatter (parallel to cache).
-                        if cutlass.const_expr(per_token_pool_scatter):
-                            pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
+                        # The snapshot belongs to the real token, so only its
+                        # last micro-step scatters.
+                        if cutlass.const_expr(
+                            per_token_pool_scatter and i_t % n_h == n_h - 1
+                        ):
+                            pool_slot_t = cutlass.Int32(
+                                ssm_state_indices[i_n, i_t // n_h]
+                            )
                             if pool_slot_t >= 0:
                                 # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
                                 # (65,536 bytes). Element multiply overflows Int32 at
@@ -1653,8 +1693,14 @@ def gdn_verify_kernel_mtp(
                             cute.autovec_copy(cute.slice_(r_h, (1, None)), inter_tile_b)
 
                         # FLA-style per-token pool scatter (parallel to cache).
-                        if cutlass.const_expr(per_token_pool_scatter):
-                            pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
+                        # The snapshot belongs to the real token, so only its
+                        # last micro-step scatters.
+                        if cutlass.const_expr(
+                            per_token_pool_scatter and i_t % n_h == n_h - 1
+                        ):
+                            pool_slot_t = cutlass.Int32(
+                                ssm_state_indices[i_n, i_t // n_h]
+                            )
                             if pool_slot_t >= 0:
                                 # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
                                 # (65,536 bytes). Element multiply overflows Int32 at
@@ -1700,12 +1746,14 @@ def gdn_verify_kernel_mtp(
                                 sOutput[(i_t, vla2)] = cutlass.BFloat16(sum_hq_a)
                                 sOutput[(i_t, vla2 + 1)] = cutlass.BFloat16(sum_hq_b)
                             else:
-                                o[(i_n, i_t, i_hv, v_idx_a)] = cutlass.BFloat16(
-                                    sum_hq_a
-                                )
-                                o[(i_n, i_t, i_hv, v_idx_b)] = cutlass.BFloat16(
-                                    sum_hq_b
-                                )
+                                # Only the last micro-step of a real token produces an output row.
+                                if cutlass.const_expr(i_t % n_h == n_h - 1):
+                                    o[(i_n, i_t // n_h, i_hv, v_idx_a)] = (
+                                        cutlass.BFloat16(sum_hq_a)
+                                    )
+                                    o[(i_n, i_t // n_h, i_hv, v_idx_b)] = (
+                                        cutlass.BFloat16(sum_hq_b)
+                                    )
 
                     # Write final state back for BOTH rows (if not disabled).
                     # Negative write indices skip the writeback.
@@ -1734,7 +1782,7 @@ def gdn_verify_kernel_mtp(
                 if tidx < tile_v:
                     v_global = v_tile_base + tidx
                     if v_global < V:
-                        o[(i_n, t_idx, i_hv, v_global)] = sOutput[(t_idx, tidx)]
+                        o[(i_n, t_idx // n_h, i_hv, v_global)] = sOutput[(t_idx, tidx)]
 
 
 @cute.jit
@@ -1779,6 +1827,7 @@ def run_gdn_verify_kernel_mtp(
     use_packed_fma: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
     cache_replayssm: cutlass.Constexpr[bool],
+    n_h: cutlass.Constexpr[int],
     stream: cuda.CUstream,
 ):
     # h0_source has two possible layouts:
@@ -1848,6 +1897,7 @@ def run_gdn_verify_kernel_mtp(
         use_packed_fma,
         per_token_pool_scatter,
         cache_replayssm,
+        n_h,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS_MTP, 1, 1],
@@ -1906,6 +1956,10 @@ def gdn_verify_kernel_mtp_inline(
     use_packed_fma: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
     cache_replayssm: cutlass.Constexpr[bool],
+    # Householders per real token.  q and a carry one row per REAL token and
+    # are synthesised for the other micro-steps; k/v/b carry all n_h.  n_h == 1
+    # is plain GDN and every predicate below folds away.
+    n_h: cutlass.Constexpr[int],
 ):
     """
     Parallel MTP kernel - each block handles one [TILE_V, TILE_K] tile.
@@ -2050,7 +2104,7 @@ def gdn_verify_kernel_mtp_inline(
             cute.make_layout((T,), stride=(1,)), cutlass.Float32
         )
         for i_t in cutlass.range_constexpr(T):
-            r_a_val = cutlass.Float32(a[i_n, i_t, i_hv])
+            r_a_val = cutlass.Float32(a[i_n, i_t // n_h, i_hv])
             r_b_val = cutlass.Float32(b[i_n, i_t, i_hv])
             x_val = r_a_val + r_dt_bias
             beta_x_val = softplus_beta * x_val
@@ -2062,7 +2116,13 @@ def gdn_verify_kernel_mtp_inline(
                     fastmath=True,
                 )
             r_g_value = -cute.exp(r_A_log, fastmath=True) * sp_x
-            r_g_arr[i_t] = cute.exp(r_g_value, fastmath=True)
+            # The gate models time passing, so it applies on the token's FIRST
+            # micro-step; the rest are neutral.
+            r_g_arr[i_t] = (
+                cute.exp(r_g_value, fastmath=True)
+                if cutlass.const_expr(i_t % n_h == 0)
+                else cutlass.Float32(1.0)
+            )
             r_beta_value = cutlass.Float32(1.0) / (
                 cutlass.Float32(1.0) + cute.exp(-r_b_val, fastmath=True)
             )
@@ -2255,8 +2315,14 @@ def gdn_verify_kernel_mtp_inline(
                             cute.autovec_copy(cute.slice_(r_h, (3, None)), inter_tile_d)
 
                         # FLA-style per-token pool scatter (inline ilp_rows=4).
-                        if cutlass.const_expr(per_token_pool_scatter):
-                            pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
+                        # The snapshot belongs to the real token, so only its
+                        # last micro-step scatters.
+                        if cutlass.const_expr(
+                            per_token_pool_scatter and i_t % n_h == n_h - 1
+                        ):
+                            pool_slot_t = cutlass.Int32(
+                                ssm_state_indices[i_n, i_t // n_h]
+                            )
                             if pool_slot_t >= 0:
                                 # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
                                 # (65,536 bytes). Element multiply overflows Int32 at
@@ -2356,18 +2422,20 @@ def gdn_verify_kernel_mtp_inline(
                                 sOutput[(i_t, vla + 2)] = cutlass.BFloat16(sum_hq_c)
                                 sOutput[(i_t, vla + 3)] = cutlass.BFloat16(sum_hq_d)
                             else:
-                                o[(i_n, i_t, i_hv, v_idx_a)] = cutlass.BFloat16(
-                                    sum_hq_a
-                                )
-                                o[(i_n, i_t, i_hv, v_idx_b)] = cutlass.BFloat16(
-                                    sum_hq_b
-                                )
-                                o[(i_n, i_t, i_hv, v_idx_c)] = cutlass.BFloat16(
-                                    sum_hq_c
-                                )
-                                o[(i_n, i_t, i_hv, v_idx_d)] = cutlass.BFloat16(
-                                    sum_hq_d
-                                )
+                                # Only the last micro-step of a real token produces an output row.
+                                if cutlass.const_expr(i_t % n_h == n_h - 1):
+                                    o[(i_n, i_t // n_h, i_hv, v_idx_a)] = (
+                                        cutlass.BFloat16(sum_hq_a)
+                                    )
+                                    o[(i_n, i_t // n_h, i_hv, v_idx_b)] = (
+                                        cutlass.BFloat16(sum_hq_b)
+                                    )
+                                    o[(i_n, i_t // n_h, i_hv, v_idx_c)] = (
+                                        cutlass.BFloat16(sum_hq_c)
+                                    )
+                                    o[(i_n, i_t // n_h, i_hv, v_idx_d)] = (
+                                        cutlass.BFloat16(sum_hq_d)
+                                    )
 
                         # Prefetch q/k/g/β for next timestep
                         if cutlass.const_expr(i_t + 1 < T):
@@ -2578,8 +2646,14 @@ def gdn_verify_kernel_mtp_inline(
                             cute.autovec_copy(cute.slice_(r_h, (1, None)), inter_tile_b)
 
                         # FLA-style per-token pool scatter (inline ilp_rows=2).
-                        if cutlass.const_expr(per_token_pool_scatter):
-                            pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
+                        # The snapshot belongs to the real token, so only its
+                        # last micro-step scatters.
+                        if cutlass.const_expr(
+                            per_token_pool_scatter and i_t % n_h == n_h - 1
+                        ):
+                            pool_slot_t = cutlass.Int32(
+                                ssm_state_indices[i_n, i_t // n_h]
+                            )
                             if pool_slot_t >= 0:
                                 # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
                                 # (65,536 bytes). Element multiply overflows Int32 at
@@ -2622,12 +2696,14 @@ def gdn_verify_kernel_mtp_inline(
                                 sOutput[(i_t, vla2)] = cutlass.BFloat16(sum_hq_a)
                                 sOutput[(i_t, vla2 + 1)] = cutlass.BFloat16(sum_hq_b)
                             else:
-                                o[(i_n, i_t, i_hv, v_idx_a)] = cutlass.BFloat16(
-                                    sum_hq_a
-                                )
-                                o[(i_n, i_t, i_hv, v_idx_b)] = cutlass.BFloat16(
-                                    sum_hq_b
-                                )
+                                # Only the last micro-step of a real token produces an output row.
+                                if cutlass.const_expr(i_t % n_h == n_h - 1):
+                                    o[(i_n, i_t // n_h, i_hv, v_idx_a)] = (
+                                        cutlass.BFloat16(sum_hq_a)
+                                    )
+                                    o[(i_n, i_t // n_h, i_hv, v_idx_b)] = (
+                                        cutlass.BFloat16(sum_hq_b)
+                                    )
 
                     # Write final state back. Negative write indices skip the writeback.
                     if cutlass.const_expr(
@@ -2656,7 +2732,7 @@ def gdn_verify_kernel_mtp_inline(
                 if tidx < tile_v:
                     v_global = v_tile_base + tidx
                     if v_global < V:
-                        o[(i_n, t_idx, i_hv, v_global)] = sOutput[(t_idx, tidx)]
+                        o[(i_n, t_idx // n_h, i_hv, v_global)] = sOutput[(t_idx, tidx)]
 
 
 @cute.jit
@@ -2700,6 +2776,7 @@ def run_gdn_verify_kernel_mtp_inline(
     use_packed_fma: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
     cache_replayssm: cutlass.Constexpr[bool],
+    n_h: cutlass.Constexpr[int],
     stream: cuda.CUstream,
 ):
     # h0_source has two possible layouts:
@@ -2763,6 +2840,7 @@ def run_gdn_verify_kernel_mtp_inline(
         use_packed_fma,
         per_token_pool_scatter,
         cache_replayssm,
+        n_h,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS_MTP, 1, 1],
@@ -2796,6 +2874,7 @@ def _mtp_kernel_name(
     use_packed_fma: bool = True,
     per_token_pool_scatter: bool = False,
     cache_replayssm: bool = False,
+    n_h: int = 1,
 ) -> str:
     """Specialization name within the gdn_decode_mtp module, encoding the
     kernel variant ("inline" or "warp") and every parameter that affects
@@ -2822,6 +2901,7 @@ def _mtp_kernel_name(
         use_packed_fma,
         per_token_pool_scatter,
         cache_replayssm,
+        n_h,
     )
 
 
@@ -2847,6 +2927,7 @@ def _get_compiled_mtp_kernel(
     use_packed_fma: bool = True,
     per_token_pool_scatter: bool = False,
     cache_replayssm: bool = False,
+    n_h: int = 1,
 ):
     """Cache compiled optimized MTP kernel for given configuration."""
     return {}
@@ -2874,6 +2955,7 @@ def _get_compiled_mtp_kernel_inline(
     use_packed_fma: bool = True,
     per_token_pool_scatter: bool = False,
     cache_replayssm: bool = False,
+    n_h: int = 1,
 ):
     """Cache compiled inline MTP kernel (BS <= 2) for given configuration."""
     return {}
@@ -2913,6 +2995,7 @@ def run_mtp_decode(
     replayssm_rawk: Optional[torch.Tensor] = None,
     replayssm_g: Optional[torch.Tensor] = None,
     replayssm_beta: Optional[torch.Tensor] = None,
+    n_h: int = 1,
 ):
     """Execute the appropriate MTP kernel based on batch size.
 
@@ -2971,8 +3054,16 @@ def run_mtp_decode(
     # checkpoints with TMA, and uses tcgen05 for every state/K and state/Q dot.
     # Keep the dispatch deliberately narrow until the remaining pool/scatter/
     # update contracts are implemented by that specialization.
+    if cache_replayssm and n_h > 1:
+        raise NotImplementedError(
+            "ReplaySSM caching precomputes per micro-step and does not model "
+            f"householders; got cache_replayssm=True with n_h={n_h}"
+        )
+
     use_replayssm_tcgen = (
-        target.major == 10
+        # ReplaySSM precomputes per micro-step and has no householder notion.
+        n_h == 1
+        and target.major == 10
         and cache_replayssm
         and disable_state_update
         and not cache_intermediate_states
@@ -3074,6 +3165,7 @@ def run_mtp_decode(
             use_packed_fma,
             per_token_pool_scatter,
             cache_replayssm,
+            n_h,
         )
         cache = _get_compiled_mtp_kernel_inline(*inline_cache_key)
     else:
@@ -3098,6 +3190,7 @@ def run_mtp_decode(
             use_packed_fma,
             per_token_pool_scatter,
             cache_replayssm,
+            n_h,
         )
         cache = _get_compiled_mtp_kernel(*warp_cache_key)
 
@@ -3261,6 +3354,7 @@ def run_mtp_decode(
                     use_packed_fma=use_packed_fma,
                     per_token_pool_scatter=per_token_pool_scatter,
                     cache_replayssm=cache_replayssm,
+                    n_h=n_h,
                     stream=stream,
                 ),
                 extra_key_files=(__file__,),
@@ -3312,6 +3406,7 @@ def run_mtp_decode(
                     use_packed_fma=use_packed_fma,
                     per_token_pool_scatter=per_token_pool_scatter,
                     cache_replayssm=cache_replayssm,
+                    n_h=n_h,
                     stream=stream,
                 ),
                 extra_key_files=(__file__,),
